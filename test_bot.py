@@ -207,6 +207,17 @@ class Feed(unittest.TestCase):
         bot.update(api, state, p, t + 70_000)
         self.assertFalse(any(r["done"] for r in p["rules"].values()))
 
+    def test_a_buy_is_never_priced_from_data_that_stops_before_it(self):
+        t = 1_000_000_000
+        p = bot.new_position("SoloFNF", {"calloutId": "s", "coinMint": "Late", "createdAt": t - 1_000}, t, "push")
+        state = {"seen": {}, "positions": {"s": p}}
+        api = FakeApi(candles=[bar(t // 1000 - 30, 1.0, 1.0, 1.0, 1.0)])     # the data is minutes behind
+        bot.update(api, state, p, t + 300_000)
+        self.assertIsNone(p["entry"])                                        # no guessing from older bars
+        self.assertEqual(api.calls[-1][1]["to"], t + 2_000 + 240_000)        # asked around the buy, not "now"
+        bot.update(api, state, p, t + 601_000)
+        self.assertEqual(state["positions"], {})                             # given up after 10 min
+
     def test_seen_list_keeps_the_newest_5000_however_old(self):
         state = {"seen": {f"s{i}": i for i in range(5_000)}, "positions": {}}
         bot.remember(state, "new", 10**13)
@@ -361,6 +372,17 @@ class Scheduler(unittest.TestCase):
             elif kind:
                 state[f"{kind}_ms"] = now
         self.assertEqual(bot.pick(state, now + 20_000, {}), ("feed", None))  # and the feed every 20 s
+
+
+class LateBuyRetries(unittest.TestCase):
+    def test_a_late_buy_is_retried_every_30_s_after_its_first_2_minutes(self):
+        now = 10_000_000
+        p = bot.new_position("schoen", {"calloutId": "w", "coinMint": "M", "createdAt": now - 181_000}, now - 180_000, "push")
+        state = {"seen": {}, "feed_ms": now, "sol_ms": now, "positions": {"w": p}}
+        p["checked_ms"] = now - 20_000
+        self.assertEqual(bot.pick(state, now, {}), (None, None))
+        p["checked_ms"] = now - 31_000
+        self.assertEqual(bot.pick(state, now, {}), ("position", p))
 
 
 class WalletWatch(unittest.TestCase):

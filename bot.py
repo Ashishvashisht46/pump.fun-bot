@@ -351,17 +351,23 @@ def update(api, state, pos, now_ms):
     pos["checked_ms"] = now_ms
     chain = pos.get("chain", SOL)
     trusted = now_ms - settle_ms(chain)
-    raw = bars(api, chain, pos["mint"], now_ms, 300)
+    landed = pos["seen_ms"] + EXEC_DELAY_S * 1000
+    # A buy is priced from bars around it, which then never scroll out of a 300-bar answer.
+    raw = bars(api, chain, pos["mint"], now_ms if pos["entry"] is not None else min(now_ms, landed + 240_000), 300)
     bs = [b for b in raw if b[0] + b[1] - 1000 <= trusted]
     if pos["entry"] is None:                      # the paper buy
-        landed = pos["seen_ms"] + EXEC_DELAY_S * 1000
-        if not any(b[0] > landed for b in bs) and now_ms - pos["seen_ms"] < 150_000:
-            return      # the data does not reach past our landing yet, so the fill window may be incomplete
+        if not any(b[0] > landed for b in bs):
+            # Data that does not reach past our landing may miss the fill window. Never
+            # guess: a 150 s fallback priced a Solana buy from bars older than the pump
+            # (2026-10-07: data minutes late, fill 0.61x the real one).
+            if now_ms - pos["seen_ms"] > 600_000:
+                log.warning("no price data past the buy for %s after 10 min; dropping it", pos["mint"])
+                del state["positions"][pos["id"]]
+            return
         price = fill_price(bs, pos["seen_ms"], landed)
         if price is None:
-            if now_ms - pos["seen_ms"] > 240_000:
-                log.warning("no price for %s after 4 min; dropping it", pos["mint"])
-                del state["positions"][pos["id"]]
+            log.warning("no trade before the buy for %s; dropping it", pos["mint"])
+            del state["positions"][pos["id"]]
             return
         pos.update(entry=price, entry_ms=landed, tokens=STAKE_USD * (1 - COST) / price, last_close=price,
                    last_bar_ms=max([b[0] for b in bs if b[0] <= landed] or [landed - 1000]))
@@ -419,7 +425,7 @@ def pick(state, now_ms, pending):
     held = [p for p in state["positions"].values() if p["entry"] is not None]
     waiting = [p for p in state["positions"].values() if p["entry"] is None
                and now_ms >= p["seen_ms"] + EXEC_DELAY_S * 1000 + settle_ms(p.get("chain", SOL)) + 1000
-               and now_ms - p["checked_ms"] >= 10_000]
+               and now_ms - p["checked_ms"] >= (10_000 if now_ms - p["seen_ms"] < 120_000 else 30_000)]
     urgent = ([p for p in held if now_ms - p["checked_ms"] >= 240_000]
               + [p for p in waiting if now_ms - p["seen_ms"] >= 120_000])
     if urgent:
