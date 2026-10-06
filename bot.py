@@ -321,14 +321,26 @@ def pnl(rule):
     return rule["proceeds"] - STAKE_USD - TIP_USD * (1 + rule["sells"])
 
 
+def settle_ms(chain):
+    """How old pump.fun's price bars must be before they are complete. Its EVM bars
+    arrived 20+ s late (2026-10-06): two BSC buys were priced from bars 13-15 s
+    older than the callout, and the late bars then counted as after the buy."""
+    return (5 if chain == SOL else 60) * 1000
+
+
 def update(api, state, pos, now_ms):
     """Price a position from its bars. Exits are scored after the fact, so a
     position needs a request only every few minutes: late is fine, as long as no
-    second is skipped."""
+    second is skipped, and only bars old enough to be complete are used."""
     pos["checked_ms"] = now_ms
-    bs = bars(api, pos.get("chain", SOL), pos["mint"], now_ms, 300)
+    chain = pos.get("chain", SOL)
+    trusted = now_ms - settle_ms(chain)
+    raw = bars(api, chain, pos["mint"], now_ms, 300)
+    bs = [b for b in raw if b[0] + b[1] - 1000 <= trusted]
     if pos["entry"] is None:                      # the paper buy
         landed = pos["seen_ms"] + EXEC_DELAY_S * 1000
+        if not any(b[0] > landed for b in bs) and now_ms - pos["seen_ms"] < 150_000:
+            return      # the data does not reach past our landing yet, so the fill window may be incomplete
         price = fill_price(bs, pos["seen_ms"], landed)
         if price is None:
             if now_ms - pos["seen_ms"] > 240_000:
@@ -340,10 +352,11 @@ def update(api, state, pos, now_ms):
         log.info("PAPER BUY $%.0f of %s (called by %s) at $%.3g; callout seen %.1fs after posting, via %s",
                  STAKE_USD, pos["mint"], pos["caller"], price, (pos["seen_ms"] - pos["callout_ms"]) / 1000,
                  pos.get("via", "list"))
-    elif len(bs) == 300 and bs[0][0] > pos["last_bar_ms"] + 1000:
+    elif len(raw) == 300 and raw[0][0] > pos["last_bar_ms"] + 1000:
         # 300 busy seconds since the last look: minute bars instead, coarser but nothing skipped
-        bs = bars(api, pos.get("chain", SOL), pos["mint"], now_ms,
-                  min(300, math.ceil((now_ms - pos["last_bar_ms"]) / 60_000) + 1), "1m")
+        bs = [b for b in bars(api, chain, pos["mint"], now_ms,
+                              min(300, math.ceil((now_ms - pos["last_bar_ms"]) / 60_000) + 1), "1m")
+              if b[0] + b[1] - 1000 <= trusted]
     for b in bs:
         end = b[0] + b[1] - 1000   # a minute bar's last second
         if end > pos["last_bar_ms"] and b[6]:   # final bars only: a forming bar can still move
@@ -382,14 +395,15 @@ def pick(state, now_ms, pending):
     3. a position about to lose data: a busy coin's last 300 one-second bars
        cover only ~5 minutes, and a paper buy must be priced within 4 minutes
     4. the SOL price, if 10 minutes old (the push alarm's size check needs it)
-    5. a paper buy waiting for its price
+    5. a paper buy waiting for its price, once its chain's bars are complete
     6. a position not checked for 2 minutes"""
     since_feed = now_ms - state.get("feed_ms", 0)
     if (pending and since_feed >= MIN_GAP_S * 1000) or since_feed >= FEED_EVERY_S * 1000:
         return "feed", None
     held = [p for p in state["positions"].values() if p["entry"] is not None]
     waiting = [p for p in state["positions"].values() if p["entry"] is None
-               and now_ms >= p["seen_ms"] + (EXEC_DELAY_S + 5) * 1000 and now_ms - p["checked_ms"] >= 10_000]
+               and now_ms >= p["seen_ms"] + EXEC_DELAY_S * 1000 + settle_ms(p.get("chain", SOL)) + 1000
+               and now_ms - p["checked_ms"] >= 10_000]
     urgent = ([p for p in held if now_ms - p["checked_ms"] >= 240_000]
               + [p for p in waiting if now_ms - p["seen_ms"] >= 120_000])
     if urgent:

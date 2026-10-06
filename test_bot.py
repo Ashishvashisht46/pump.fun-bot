@@ -168,6 +168,22 @@ class Feed(unittest.TestCase):
         bot.update(api, {"seen": {}, "positions": {"b": p}}, p, now + 8_000)
         self.assertEqual(api.calls[0][0], "/candles/eip155:56/0xB88a")   # its own chain's prices
 
+    def test_an_evm_buy_waits_until_its_late_price_bars_have_arrived(self):
+        t = 1_000_000_000
+        p = bot.new_position("SoloFNF", {"calloutId": "e", "coinMint": "0xC0in", "createdAt": t - 2_000,
+                                         "chain": "eip155:56"}, t, "push")
+        state = {"seen": {}, "positions": {"e": p}, "feed_ms": t + 30_000, "sol_ms": t + 30_000}
+        api = FakeApi(candles=[bar(t // 1000 - 15, 1.0, 1.0, 1.0, 1.0)])      # all BSC data had at first
+        self.assertEqual(bot.pick(state, t + 30_000, {}), (None, None))       # too soon to ask: bars not complete
+        bot.update(api, state, p, t + 63_000)
+        self.assertIsNone(p["entry"])                                          # nothing past our landing yet
+        api.candles += [bar(t // 1000 + 1, 1.3, 1.3, 1.3, 1.3), bar(t // 1000 + 5, 1.2, 1.2, 1.2, 1.2)]
+        bot.update(api, state, p, t + 70_000)
+        self.assertEqual(p["entry"], 1.3)                                      # the real price in the window
+        api.candles.append(bar(t // 1000 + 40, 0.5, 0.5, 0.5, 0.5))           # a crash only 30 s old: not yet trusted
+        bot.update(api, state, p, t + 70_000)
+        self.assertFalse(any(r["done"] for r in p["rules"].values()))
+
     def test_seen_list_keeps_the_newest_5000_however_old(self):
         state = {"seen": {f"s{i}": i for i in range(5_000)}, "positions": {}}
         bot.remember(state, "new", 10**13)
@@ -388,7 +404,8 @@ class EndToEnd(unittest.TestCase):
             alarm = bot.push_match(row, {"MintX": ("marcell", t0 + 3_600_000, 10.0)}, t0, 120.0)
             bot.DETECTED.put((*alarm, t0))                       # pushed 1 s after posting
             api = FakeApi(now_ms=t0, takes_ms=800, feed=[feed_row("x1", PROFILE["marcell"], "MintX", t0 - 1_000)],
-                          candles=[bar(t0 // 1000, 1.0, 1.02, 1.0, 1.01), bar(t0 // 1000 + 1, 1.01, 1.05, 1.0, 1.04)])
+                          candles=[bar(t0 // 1000, 1.0, 1.02, 1.0, 1.01), bar(t0 // 1000 + 1, 1.01, 1.05, 1.0, 1.04),
+                                   bar(t0 // 1000 + 3, 1.04, 1.04, 1.03, 1.04)])
             state = bot.load()
             self.assertTrue(bot.step(api, state))                # the alarm makes it ask the feed at once
             p = state["positions"]["x1"]
