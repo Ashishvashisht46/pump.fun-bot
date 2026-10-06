@@ -77,12 +77,35 @@ class ExitRules(unittest.TestCase):
         p = position()
         bot.apply_bar(p, bar(1, 1.0, 1.25, 0.95, 1.2))
         bot.apply_bar(p, bar(2, 1.5, 2.1, 1.4, 2.0))
-        main = p["rules"]["main: 80% at +20%, 20% rides to 2x"]
+        main = p["rules"]["old main: 80% at +20%, 20% rides to 2x"]
         want = 0.8 * TOKENS * 1.2 * (1 - bot.COST) + 0.2 * TOKENS * 2.0 * (1 - bot.COST)
         self.assertAlmostEqual(main["proceeds"], want)
         self.assertTrue(main["done"])
         self.assertAlmostEqual(bot.pnl(main), want - bot.STAKE_USD - 3 * bot.TIP_USD)   # 1 buy + 2 sells
         self.assertEqual(main["fills"], [[1000, 0.8, 1.2, "target 1.2x"], [2000, 0.2, 2.0, "target 2x"]])
+
+    def test_safer_rule_raises_its_stop_after_the_first_sale_from_the_next_bar(self):
+        p = position()
+        bot.apply_bar(p, bar(1, 1.0, 1.35, 1.0, 1.3))           # 50% sold at 1.3x; stop goes to 1.05x
+        bot.apply_bar(p, bar(2, 1.3, 1.3, 1.04, 1.1))           # dips to 1.04: the raised stop sells the rest
+        safer = p["rules"]["safer: 50% at +30%, rest trails 30%, stop to 1.05x"]
+        self.assertEqual(safer["fills"], [[1000, 0.5, 1.3, "target 1.3x"], [2000, 0.5, 1.05, "stop 1.05x"]])
+        self.assertAlmostEqual(p["rules"]["main: 50% at +30%, 50% rides to 2x"]["left"], 0.5)   # main still rides
+
+    def test_safer_rule_trails_30_percent_below_the_peak(self):
+        p = position()
+        bot.apply_bar(p, bar(1, 1.0, 1.35, 1.0, 1.3))
+        bot.apply_bar(p, bar(2, 1.4, 2.0, 1.4, 1.9))            # peak 2.0: the trailing stop is now 1.4
+        bot.apply_bar(p, bar(3, 1.9, 1.9, 1.39, 1.5))
+        safer = p["rules"]["safer: 50% at +30%, rest trails 30%, stop to 1.05x"]
+        self.assertEqual(safer["fills"][-1][1:3], [0.5, 1.4])
+        self.assertTrue(safer["fills"][-1][3].startswith("trailing stop"))
+
+    def test_positions_opened_under_a_retired_rule_still_sell_by_it(self):
+        p = position()
+        p["rules"]["all at +10%"] = {"left": 1.0, "hit": [False], "proceeds": 0.0, "sells": 0, "done": False}
+        bot.apply_bar(p, bar(1, 1.0, 1.15, 1.0, 1.1))
+        self.assertTrue(p["rules"]["all at +10%"]["done"])
 
     def test_bar_touching_stop_and_target_is_the_stop(self):
         p = position()
@@ -418,6 +441,7 @@ class EndToEnd(unittest.TestCase):
             bot.step(api, state)                                 # the paper buy, at the window high
             self.assertEqual(state["positions"]["x1"]["entry"], 1.05)
             api.candles.append(bar(t0 // 1000 + 4, 1.1, 2.3, 1.1, 2.2))
+            api.candles.append(bar(t0 // 1000 + 6, 1.5, 1.5, 1.5, 1.5))   # back through the 30% trailing stop
             api.t = t0 + 140_000
             bot.step(api, state)                                 # the feed is due first...
             bot.step(api, state)                                 # ...then the routine check: every target reached

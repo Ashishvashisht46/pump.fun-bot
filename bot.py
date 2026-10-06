@@ -95,12 +95,20 @@ EVM_ALARM_USD = 300      # no wallet watch on EVM chains, and ~5 EVM callouts a 
                          # marcell's Solana buys run in the thousands) get asked about at once
 LIMIT_MIN = 60           # anything still held after this is sold at the market
 
-RULES = {  # name: ([(fraction to sell, at this multiple of our fill)], stop multiple)
-    "main: 80% at +20%, 20% rides to 2x": ([(0.8, 1.2), (0.2, 2.0)], 0.7),
-    "all at +10%": ([(1.0, 1.1)], 0.7),
-    "50% at +20%, 50% at 2x": ([(0.5, 1.2), (0.5, 2.0)], 0.7),
-    "all at 2x": ([(1.0, 2.0)], 0.7),
+RULES = {  # name: ([(fraction to sell, at this multiple of our fill)], stop multiple,
+           #        stop multiple once a target has sold, trailing stop on the rest once a target has sold)
+    # Per $100 trade on 47 past callouts, bought 3.4 s after posting (scratchpad optimize.py, 2026-10-06):
+    "main: 50% at +30%, 50% rides to 2x": ([(0.5, 1.3), (0.5, 2.0)], 0.7, None, None),               # +4.56
+    "safer: 50% at +30%, rest trails 30%, stop to 1.05x": ([(0.5, 1.3)], 0.7, 1.05, 0.3),           # +2.91
+    "old main: 80% at +20%, 20% rides to 2x": ([(0.8, 1.2), (0.2, 2.0)], 0.7, None, None),          # +0.66
+    "50% at +20%, 50% at 2x": ([(0.5, 1.2), (0.5, 2.0)], 0.7, None, None),                          # +3.33
+    "all at 2x": ([(1.0, 2.0)], 0.7, None, None),                                                   # +8.45
 }
+RETIRED = {  # still applied to positions opened before they were dropped or renamed
+    "main: 80% at +20%, 20% rides to 2x": RULES["old main: 80% at +20%, 20% rides to 2x"],
+    "all at +10%": ([(1.0, 1.1)], 0.7, None, None),                                                 # -2.57
+}
+RENAMED = {"main: 80% at +20%, 20% rides to 2x": "old main: 80% at +20%, 20% rides to 2x"}
 
 log = logging.getLogger("callout-bot")
 MINTS = {}                 # coin -> (caller, unix ms the watch ends, SOL they spent on it)
@@ -262,8 +270,8 @@ def new_position(caller, c, seen_ms, via):
             "size_ratio": c.get("size_ratio"),
             "mcap": c.get("marketCap"), "entry": None, "tokens": None,
             "last_bar_ms": None, "last_close": None, "checked_ms": 0,
-            "rules": {name: {"left": 1.0, "hit": [False] * len(legs), "proceeds": 0.0, "sells": 0, "done": False}
-                      for name, (legs, _) in RULES.items()}}
+            "rules": {name: {"left": 1.0, "hit": [False] * len(rule[0]), "proceeds": 0.0, "sells": 0, "done": False}
+                      for name, rule in RULES.items()}}
 
 
 # ---- prices and exits ------------------------------------------------------------
@@ -295,24 +303,32 @@ def sell(rule, frac, price, tokens, t_ms, why):
 
 def apply_bar(pos, bar):
     """One price bar against every rule. A bar that touches both the stop and a
-    target is taken as the stop (we cannot know the order inside a bar)."""
+    target is taken as the stop (we cannot know the order inside a bar); a stop
+    raised by a target, and a trailing stop, take effect from the next bar."""
     t, w, o, h, l, c, _ = bar
     entry, tokens = pos["entry"], pos["tokens"]
-    for name, (legs, stop) in RULES.items():
-        r = pos["rules"][name]
+    for name, r in pos["rules"].items():
         if r["done"]:
             continue
+        legs, stop, after, trail = {**RETIRED, **RULES}[name]
+        level = entry * r.get("stop", stop)
+        why = f"stop {r.get('stop', stop):g}x"
+        if trail and any(r["hit"]) and r.get("peak", entry) * (1 - trail) > level:
+            level, why = r.get("peak", entry) * (1 - trail), f"trailing stop {trail:.0%} below the peak"
         if t >= pos["entry_ms"] + LIMIT_MIN * 60_000:
             sell(r, r["left"], c, tokens, t, f"{LIMIT_MIN}-min limit")
-        elif o <= entry * stop:
-            sell(r, r["left"], o, tokens, t, "stop (opened below it)")
-        elif l <= entry * stop:
-            sell(r, r["left"], entry * stop, tokens, t, f"stop {stop:g}x")
+        elif o <= level:
+            sell(r, r["left"], o, tokens, t, why + " (opened below it)")
+        elif l <= level:
+            sell(r, r["left"], level, tokens, t, why)
         else:
             for i, (frac, tgt) in enumerate(legs):
                 if not r["hit"][i] and h >= entry * tgt:
                     r["hit"][i] = True
                     sell(r, min(frac, r["left"]), max(entry * tgt, o), tokens, t, f"target {tgt:g}x")
+                    if after:
+                        r["stop"] = max(r.get("stop", stop), after)
+        r["peak"] = max(r.get("peak", entry), h)
         if r["left"] <= 1e-9:
             r["left"], r["done"] = 0.0, True
 
@@ -716,7 +732,12 @@ def read_trades():
     if not os.path.exists(path):
         return []
     with open(path, encoding="utf-8") as f:
-        return [json.loads(line) for line in f]
+        trades = [json.loads(line) for line in f]
+    for t in trades:   # rules renamed since the trade was recorded
+        for key in ("pnl", "fills", "original_pnl"):
+            if isinstance(t.get(key), dict):
+                t[key] = {RENAMED.get(k, k): v for k, v in t[key].items()}
+    return trades
 
 
 def history():
@@ -777,10 +798,7 @@ def report():
     if wrong or unsure:
         print(f"left out below: {wrong} pushed callouts that were strangers', {unsure} whose caller was never "
               f"confirmed")
-    passed = [t["pnl"].get(next(iter(RULES))) for t in trades if t.get("author_ok") is False and t.get("size_ratio")]
-    if passed:   # these slipped past the size check: a live bot would have bought them too
-        print(f"strangers' callouts that passed the size check: {len(passed)}, main rule total {sum(passed):+.2f}")
-    good = [t for t in trades if t.get("author_ok", True) is True]   # older trades predate the check
+    good =[t for t in trades if t.get("author_ok", True) is True]   # older trades predate the check
     ratios = sorted(t["size_ratio"] for t in good if t.get("size_ratio"))
     if ratios:
         print(f"confirmed push matches: position/spend ratio {ratios[0]:.2f}-{ratios[-1]:.2f}, "
