@@ -2,6 +2,10 @@
 
     .venv\\Scripts\\python.exe -m unittest test_bot -v
 """
+import collections
+import contextlib
+import csv
+import io
 import json
 import os
 import tempfile
@@ -75,6 +79,7 @@ class ExitRules(unittest.TestCase):
         self.assertAlmostEqual(main["proceeds"], want)
         self.assertTrue(main["done"])
         self.assertAlmostEqual(bot.pnl(main), want - bot.STAKE_USD - 3 * bot.TIP_USD)   # 1 buy + 2 sells
+        self.assertEqual(main["fills"], [[1000, 0.8, 1.2, "target 1.2x"], [2000, 0.2, 2.0, "target 2x"]])
 
     def test_bar_touching_stop_and_target_is_the_stop(self):
         p = position()
@@ -277,6 +282,35 @@ class WalletWatch(unittest.TestCase):
         self.assertEqual(bot.received(tx(True, [("Held", "5"), ("CoinA", "9"), (bot.WSOL, "7")]), WALLET), {"CoinA"})
         self.assertEqual(bot.received(tx(True, [("Held", "9")]), WALLET), {"Held"})    # more of one it held
         self.assertEqual(bot.received(tx(False, [("CoinA", "9")]), WALLET), set())     # someone else's transaction
+
+
+class History(unittest.TestCase):
+    def test_the_csv_adds_up_to_each_trades_result_with_or_without_recorded_sells(self):
+        p = position()
+        bot.apply_bar(p, bar(1, 1.0, 1.25, 0.95, 1.2))
+        bot.apply_bar(p, bar(2, 0.6, 0.65, 0.5, 0.55))           # the rest gaps through the stop
+        new = {"id": "n", "caller": "schoen", "mint": "M", "mcap": 1, "callout_ms": 0, "seen_ms": 500, "via": "push",
+               "author_ok": True, "entry": ENTRY, "entry_ms": 0, "tokens": TOKENS,
+               "fills": {k: r["fills"] for k, r in p["rules"].items()},
+               "pnl": {k: round(bot.pnl(r), 2) for k, r in p["rules"].items()}}
+        old = {"id": "o", "caller": "schoen", "mint": "N", "mcap": 1, "callout_ms": 0, "seen_ms": 38_400,
+               "entry": ENTRY, "pnl": {k: -26.71 for k in bot.RULES}}                     # an older record
+        stranger = dict(old, id="s", author_ok=False)
+        with tempfile.TemporaryDirectory() as d:
+            bot.STATE_DIR = d
+            for t in (new, old, stranger):
+                bot.record("trades.jsonl", t)
+            with contextlib.redirect_stdout(io.StringIO()):
+                bot.history()
+            with open(os.path.join(d, "history.csv"), encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+        sums = collections.Counter()
+        for r in rows:
+            sums[(r["trade"], r["rule"])] += float(r["net_usd"])
+        for n, t in (("1", new), ("2", old)):                     # the stranger's trade is left out
+            for rule, result in t["pnl"].items():
+                self.assertAlmostEqual(sums[(n, rule)], result, places=1)
+        self.assertNotIn("3", {r["trade"] for r in rows})
 
 
 class EndToEnd(unittest.TestCase):

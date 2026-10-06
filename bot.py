@@ -6,6 +6,7 @@ rules. It holds no key and contains no code that can send a transaction.
 
     .venv\\Scripts\\python.exe bot.py           run
     .venv\\Scripts\\python.exe bot.py report    results so far
+    .venv\\Scripts\\python.exe bot.py history   every trade: buy, sells, fees (also state/history.csv)
 
 Why callouts and not the callers' wallet buys: 84% of their buys are never
 called; the callout is what moves the price (study in the Obsidian vault,
@@ -28,8 +29,9 @@ How it sees a callout within ~2 s:
   confirmation usually goes out at once. The per-caller /callout/list showed a
   callout ~38 s late and is no longer used.
 """
-import collections
 import asyncio
+import collections
+import csv
 import json
 import logging
 import math
@@ -267,10 +269,11 @@ def fill_price(bs, seen_ms, landed_ms):
     return before[-1] if before else None
 
 
-def sell(rule, frac, price, tokens):
+def sell(rule, frac, price, tokens, t_ms, why):
     rule["proceeds"] += frac * tokens * price * (1 - COST)
     rule["left"] -= frac
     rule["sells"] += 1
+    rule.setdefault("fills", []).append([t_ms, round(frac, 6), price, why])
 
 
 def apply_bar(pos, bar):
@@ -283,16 +286,16 @@ def apply_bar(pos, bar):
         if r["done"]:
             continue
         if t >= pos["entry_ms"] + LIMIT_MIN * 60_000:
-            sell(r, r["left"], c, tokens)
+            sell(r, r["left"], c, tokens, t, f"{LIMIT_MIN}-min limit")
         elif o <= entry * stop:
-            sell(r, r["left"], o, tokens)
+            sell(r, r["left"], o, tokens, t, "stop (opened below it)")
         elif l <= entry * stop:
-            sell(r, r["left"], entry * stop, tokens)
+            sell(r, r["left"], entry * stop, tokens, t, f"stop {stop:g}x")
         else:
             for i, (frac, tgt) in enumerate(legs):
                 if not r["hit"][i] and h >= entry * tgt:
                     r["hit"][i] = True
-                    sell(r, min(frac, r["left"]), max(entry * tgt, o), tokens)
+                    sell(r, min(frac, r["left"]), max(entry * tgt, o), tokens, t, f"target {tgt:g}x")
         if r["left"] <= 1e-9:
             r["left"], r["done"] = 0.0, True
 
@@ -333,12 +336,15 @@ def update(api, state, pos, now_ms):
         # out: sell what is left at the last price anyone paid.
         for r in pos["rules"].values():
             if not r["done"]:
-                sell(r, r["left"], pos["last_close"], pos["tokens"])
+                sell(r, r["left"], pos["last_close"], pos["tokens"], pos["entry_ms"] + LIMIT_MIN * 60_000,
+                     f"{LIMIT_MIN}-min limit (no trade since)")
                 r["left"], r["done"] = 0.0, True
     if all(r["done"] for r in pos["rules"].values()):
         trade = {"id": pos["id"], "caller": pos["caller"], "mint": pos["mint"], "mcap": pos["mcap"],
                  "callout_ms": pos["callout_ms"], "seen_ms": pos["seen_ms"], "via": pos.get("via"),
                  "author_ok": pos.get("author_ok"), "size_ratio": pos.get("size_ratio"), "entry": pos["entry"],
+                 "entry_ms": pos["entry_ms"], "tokens": pos["tokens"],
+                 "fills": {name: r.get("fills", []) for name, r in pos["rules"].items()},
                  "pnl": {name: round(pnl(r), 2) for name, r in pos["rules"].items()}}
         record("trades.jsonl", trade)
         del state["positions"][pos["id"]]
@@ -613,8 +619,9 @@ def run():
                                     encoding="utf-8")]
     logging.basicConfig(level=logging.INFO, handlers=handlers, format="%(asctime)s %(levelname)s %(message)s")
     logging.getLogger("websockets").setLevel(logging.WARNING)
-    log.info("PAPER MODE: no wallet, no keys, nothing is ever sent. $%.0f a trade, %d callers, one pump.fun "
-             "request per %.0fs; rules: %s", STAKE_USD, len(CALLERS), MIN_GAP_S, "; ".join(RULES))
+    log.info("PAPER MODE: no wallet, no keys, nothing is ever sent. $%.0f a trade, %d callers, at most %d "
+             "pump.fun requests a minute, %.0f s apart; rules: %s", STAKE_USD, len(CALLERS), MAX_PER_MIN, MIN_GAP_S,
+             "; ".join(RULES))
     env = load_env()
     if env.get("SOLANA_WSS_URL") and env.get("SOLANA_RPC_URL"):
         threading.Thread(target=asyncio.run, args=(live(env["SOLANA_WSS_URL"], env["SOLANA_RPC_URL"]),),
@@ -622,6 +629,7 @@ def run():
     else:
         log.warning("no SOLANA_WSS_URL/SOLANA_RPC_URL in .env: push matching OFF, callouts seen in 7-14 s")
     api, state, beat = Api(), load(), 0.0
+    state.pop("sol_ms", None)   # the price itself is not saved: fetch it now, the alarm's size check needs it
     # Earlier versions opened positions on unconfirmed push matches, mostly strangers' callouts.
     # Now a position opens only once the feed confirms the caller, so those are not this strategy.
     drop = [k for k, p in state["positions"].items() if p.get("via") == "push" and p.get("author_ok") is not True]
@@ -651,12 +659,64 @@ def run():
         log.info("stopped; %d open paper positions saved", len(state["positions"]))
 
 
-def report():
-    trades = []
+def read_trades():
     path = os.path.join(STATE_DIR, "trades.jsonl")
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            trades = [json.loads(line) for line in f]
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f]
+
+
+def history():
+    """Every trade on a confirmed callout: the buy, each sell with its fee and tip,
+    and the result per rule. Also writes state/history.csv (one row per buy or sell;
+    its net column adds up to each trade's result)."""
+    rows = [["trade", "callout", "caller", "coin", "via", "seen_after_s", "rule", "action", "time", "share",
+             "multiple", "price_usd", "value_usd", "fee_usd", "tip_usd", "net_usd", "reason"]]
+    trades = [t for t in read_trades() if t.get("author_ok", True) is True]   # older trades predate the check
+
+    def when(ms):
+        return datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
+    totals = collections.Counter()
+    for n, t in enumerate(trades, 1):
+        entry, lag = t["entry"], (t["seen_ms"] - t["callout_ms"]) / 1000
+        tokens = t.get("tokens") or STAKE_USD * (1 - COST) / entry
+        bought = t.get("entry_ms") or t["seen_ms"] + EXEC_DELAY_S * 1000
+        head = [n, when(t["callout_ms"]), t["caller"], t["mint"], t.get("via") or "list", round(lag, 1)]
+        print(f"\n#{n} {when(t['callout_ms'])}  {t['caller']} called {t['mint']} at ${t.get('mcap') or 0:,.0f} "
+              f"market cap; seen {lag:.1f}s later via {t.get('via') or 'the old per-caller list'}")
+        print(f"   BUY  {when(bought)}  ${STAKE_USD:.2f} = fee ${STAKE_USD * COST:.2f} + ${STAKE_USD * (1 - COST):.2f}"
+              f" for {tokens:,.0f} tokens at ${entry:.4g}; tip ${TIP_USD:.2f}")
+        for name, result in t["pnl"].items():
+            totals[name] += result
+            rows.append(head + [name, "BUY", when(bought), 1, 1, entry, -STAKE_USD, round(STAKE_USD * COST, 2),
+                                TIP_USD, -STAKE_USD - TIP_USD, ""])
+            fills = (t.get("fills") or {}).get(name)
+            print(f"   {name}: {result:+.2f}")
+            if fills is None:
+                print("      (this version did not record the sells)")
+                rows.append(head + [name, "SELLS", "", "", "", "", "", "", "", round(result + STAKE_USD + TIP_USD, 2),
+                                    "not recorded by this version"])
+                continue
+            for ms, share, price, why in fills:
+                value = share * tokens * price
+                fee, net = value * COST, value * (1 - COST) - TIP_USD
+                print(f"      SELL {when(ms)}  {share:.0%} at {price / entry:.2f}x (${price:.4g}), {why}: "
+                      f"${value:.2f} - fee ${fee:.2f} - tip ${TIP_USD:.2f} = ${net:.2f}")
+                rows.append(head + [name, "SELL", when(ms), share, round(price / entry, 4), price, round(value, 2),
+                                    round(fee, 2), TIP_USD, round(net, 2), why])
+    if trades:
+        print(f"\nTotals over {len(trades)} trades ($100 each):")
+        for name, total in totals.items():
+            print(f"   {name:<36} {total:+9.2f}")
+    path = os.path.join(STATE_DIR, "history.csv")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(rows)
+    print(f"\nwritten to {path} (opens in Excel)")
+
+
+def report():
+    trades = read_trades()
     print(f"{len(trades)} closed paper trades, {len(load()['positions'])} open, ${STAKE_USD:.0f} each")
     wrong = sum(t.get("author_ok") is False for t in trades)
     unsure = sum("author_ok" in t and t["author_ok"] is None for t in trades)
@@ -689,4 +749,4 @@ def report():
 
 
 if __name__ == "__main__":
-    report() if sys.argv[1:] == ["report"] else run()
+    {"report": report, "history": history}.get(sys.argv[1] if sys.argv[1:] else "", run)()
