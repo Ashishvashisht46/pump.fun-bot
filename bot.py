@@ -9,25 +9,33 @@ rules. It holds no key and contains no code that can send a transaction.
 
 Why callouts and not the callers' wallet buys: 84% of their buys are never
 called; the callout is what moves the price (study in the Obsidian vault,
-robinhood-bot AD-050).
+robinhood-bot AD-050). The main rule needs the callout within ~5 s.
 
-Why it also watches their wallets: pump.fun allows only about 8-10 requests a
-minute per address (a request every 1.1 s was blocked within 11 s and stayed
-blocked for minutes; one every 7 s held up in long runs). Five callers asked in
-turn would each be checked only every ~35 s, and the main rule needs the
-callout within ~5 s. Callers buy a median 1.3 minutes before calling, so the bot
-watches their wallets' SOL balances on-chain (the Helius websocket in .env) and
-spends its pump.fun requests on a caller right after that caller spends SOL.
+How it sees a callout within ~2 s:
+- PUSH: pump.fun's website gets every new callout pushed over its public NATS
+  websocket (homeFeedNew.head.solana.prod, with the public 'subscriber' login that
+  is in the homepage HTML). Measured over 179 callouts on 2026-10-06: they arrived
+  0.4-2.9 s after posting, median 1.4 s. A pushed row names the coin, not the caller.
+- EARLY WARNING: the callers' SOL balances (Helius websocket in .env). A drop over
+  0.05 SOL means the caller bought; one RPC lookup names the coin. A pushed callout
+  on a coin one of our callers bought in the last hour is taken as theirs.
+- FEED: GET /home-feed/new lists the newest callouts site-wide with their callers.
+  Polled every 7-14 s (pump.fun allows ~8-10 requests a minute), it catches what the
+  push match misses and confirms the caller of every push match. The per-caller
+  /callout/list showed a callout ~38 s late and is no longer used.
 """
 import asyncio
 import json
 import logging
 import math
 import os
+import queue
+import re
 import statistics
 import sys
 import threading
 import time
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
 import requests
@@ -36,14 +44,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_DIR = os.path.join(HERE, "state")
 API = "https://frontend-api-v3.pump.fun"
 SOL = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+WSOL = "So11111111111111111111111111111111111111112"
+PUSH_SUBJECT = "homeFeedNew.head.solana.prod"
 
-CALLERS = {  # name: (pump.fun profile id, which keys the callout feed; Solana wallet)
+CALLERS = {  # name: (pump.fun profile id, Solana wallet)
     "marcell": ("240b8242-5715-492e-828c-1622aac53376", "6vbrTLsWy76TxDQAUKLqZrPohQuq6EVaJgfGzR82paFa"),
     "ily": ("e77e7b24-34ee-4a1e-9966-3fa8c27f46e8", "AcoNeFQsTPYs7ZrH8RMWaxxGJTTQJJ4H5aTXmptaz5UK"),
     "schoen": ("cd23adcb-133e-4614-9493-535dc5c3c85a", "5hAgYC8TJCcEZV7LTXAzkTrm7YL29YXyQQJPCNrG84zM"),
     "pxblocito": ("fb7b35f3-7815-4e7b-8985-a7d96cc403d7", "7Mwof5tBvNPC6e1zwtHRQynqXcuDpqqbeY9vSZLW2Bv8"),
     "SoloFNF": ("d18fbf14-83bd-4331-acfe-920c81096899", "GccvEcZqMrcNdp3CarCasGdN5dUfdQ4wZ6iQsk5myRzX"),
 }
+BY_PROFILE = {profile: name for name, (profile, _) in CALLERS.items()}
 
 STAKE_USD = float(os.getenv("STAKE_USD", "100"))
 COST = float(os.getenv("COST_EACH_WAY", "0.02"))   # pump.fun fee ~1.2% + price impact
@@ -51,10 +62,10 @@ TIP_USD = float(os.getenv("TIP_USD", "1.0"))       # priority fee / Jito tip per
 EXEC_DELAY_S = 2         # our buy would land ~2 s after we see the callout
 MAX_CALLOUT_AGE_S = 60   # older than this when first seen (e.g. after a restart): not bought
 MIN_GAP_S = float(os.getenv("PUMP_MIN_GAP_S", "7"))   # one pump.fun request per this many seconds
+FEED_MAX_GAP_S = 14      # the site-wide feed is polled at least this often
 SPEND_SOL = 0.05         # a wallet dropping more than this bought something; fees are far smaller,
                          # and all 32 buys before a callout in the study were 0.084 SOL or more
-HOT_MIN = 10             # after a caller spends, check their callouts at full speed this long
-OVERDUE_S = 180          # meanwhile every other caller is still checked at least this often
+MINT_WATCH_MIN = 60      # a pushed callout on a coin a caller bought this recently is theirs
 LIMIT_MIN = 60           # anything still held after this is sold at the market
 
 RULES = {  # name: ([(fraction to sell, at this multiple of our fill)], stop multiple)
@@ -65,7 +76,8 @@ RULES = {  # name: ([(fraction to sell, at this multiple of our fill)], stop mul
 }
 
 log = logging.getLogger("callout-bot")
-HOT = {}   # caller -> unix ms until which they are checked at full speed (set by the wallet watch)
+MINTS = {}                 # coin -> (caller, unix ms until which a callout on it counts as theirs)
+DETECTED = queue.Queue()   # (caller, callout, arrival ms) from the push thread to the main loop
 
 
 class Api:
@@ -133,7 +145,7 @@ def load():
             state = json.load(f)
     except FileNotFoundError:
         state = {}
-    for key in ("seen", "positions", "polled"):
+    for key in ("seen", "positions"):
         state.setdefault(key, {})
     return state
 
@@ -154,33 +166,63 @@ def record(name, row):
 
 # ---- callouts --------------------------------------------------------------------
 
-def poll(api, state, caller):
-    """New, fresh, Solana callouts from one caller. Each callout is considered once.
-    The seen time is taken when the answer arrives: the request itself may have waited."""
-    d = api.get(f"/callout/list/{CALLERS[caller][0]}", {"limit": 3, "sortBy": "TIMESTAMP", "sortOrder": "DESC"})
-    now_ms = api.now_ms()
-    state["polled"][caller] = now_ms
-    out = []
-    for c in (d or {}).get("callouts") or []:
-        if c["calloutId"] in state["seen"]:
-            continue
-        state["seen"][c["calloutId"]] = c["createdAt"]
-        age = (now_ms - c["createdAt"]) / 1000
-        if age > MAX_CALLOUT_AGE_S:
-            log.info("%s callout %s is %.0fs old; not buying", caller, c["coinMint"], age)
-        elif c["coinMint"].startswith("0x"):
-            log.info("%s called EVM coin %s; only Solana coins are tracked", caller, c["coinMint"])
-        else:
-            c["_seen_ms"] = now_ms
-            out.append(c)
-    if len(state["seen"]) > 5000:   # by count, not age: an idle caller's old callouts must stay seen
+def remember(state, callout_id, created_ms):
+    """Mark a callout as handled. Capped by count, not age: old ones must stay seen."""
+    state["seen"][callout_id] = created_ms
+    if len(state["seen"]) > 5000:
         state["seen"] = dict(sorted(state["seen"].items(), key=lambda kv: kv[1])[-5000:])
+
+
+def poll_feed(api, state):
+    """New callouts by our callers from pump.fun's site-wide "New" feed, which lists
+    every position-backed callout with its caller, newest first. It also settles who
+    made each callout a position was opened on from the push."""
+    d = api.get("/home-feed/new", {"pageSize": 50, "chain": "solana"})
+    now_ms = api.now_ms()
+    state["feed_ms"] = now_ms
+    out = []
+    for row in (d or {}).get("coins") or []:
+        pos = row.get("position") or {}
+        c = pos.get("callout") or {}
+        cid, caller = c.get("calloutId"), BY_PROFILE.get(pos.get("userId"))
+        if not cid or not c.get("calloutTimestamp"):
+            continue
+        p = state["positions"].get(cid)
+        if p is not None and p.get("author_ok") is None:
+            p["author_ok"] = caller == p["caller"]
+            if not p["author_ok"]:
+                log.warning("the pushed callout on %s was by %s, not %s; trade kept, marked wrong",
+                            p["mint"], pos.get("userName") or "someone else", p["caller"])
+        if caller is None or cid in state["seen"]:
+            continue
+        created = int(datetime.fromisoformat(c["calloutTimestamp"].replace("Z", "+00:00")).timestamp() * 1000)
+        remember(state, cid, created)
+        age = (now_ms - created) / 1000
+        if age > MAX_CALLOUT_AGE_S:
+            log.info("%s callout %s is %.0fs old; not buying", caller, row["coinMint"], age)
+            continue
+        out.append((caller, {"calloutId": cid, "coinMint": row["coinMint"], "createdAt": created,
+                             "marketCap": c.get("calledOutAtMcap")}, now_ms))
     return out
 
 
-def new_position(caller, c, seen_ms, hot):
+def take_pushed(state):
+    """Callouts the push thread matched to our callers since the last look."""
+    out = []
+    while True:
+        try:
+            caller, c, seen_ms = DETECTED.get_nowait()
+        except queue.Empty:
+            return out
+        if c["calloutId"] not in state["seen"]:
+            remember(state, c["calloutId"], c["createdAt"])
+            out.append((caller, c, seen_ms))
+
+
+def new_position(caller, c, seen_ms, via):
     return {"id": c["calloutId"], "caller": caller, "mint": c["coinMint"], "callout_ms": c["createdAt"],
-            "seen_ms": seen_ms, "hot": hot, "mcap": c.get("marketCap"), "entry": None, "tokens": None,
+            "seen_ms": seen_ms, "via": via, "author_ok": True if via == "feed" else None,
+            "mcap": c.get("marketCap"), "entry": None, "tokens": None,
             "last_bar_ms": None, "last_close": None, "checked_ms": 0,
             "rules": {name: {"left": 1.0, "hit": [False] * len(legs), "proceeds": 0.0, "sells": 0, "done": False}
                       for name, (legs, _) in RULES.items()}}
@@ -256,9 +298,9 @@ def update(api, state, pos, now_ms):
             return
         pos.update(entry=price, entry_ms=landed, tokens=STAKE_USD * (1 - COST) / price, last_close=price,
                    last_bar_ms=max([b[0] for b in bs if b[0] <= landed] or [landed - 1000]))
-        log.info("PAPER BUY $%.0f of %s (called by %s) at $%.3g; callout seen %.1fs after posting%s",
+        log.info("PAPER BUY $%.0f of %s (called by %s) at $%.3g; callout seen %.1fs after posting, via %s",
                  STAKE_USD, pos["mint"], pos["caller"], price, (pos["seen_ms"] - pos["callout_ms"]) / 1000,
-                 " (early warning was on)" if pos.get("hot") else "")
+                 pos.get("via", "list"))
     elif len(bs) == 300 and bs[0][0] > pos["last_bar_ms"] + 1000:
         # 300 busy seconds since the last look: minute bars instead, coarser but nothing skipped
         bs = bars(api, pos["mint"], now_ms, min(300, math.ceil((now_ms - pos["last_bar_ms"]) / 60_000) + 1), "1m")
@@ -276,8 +318,9 @@ def update(api, state, pos, now_ms):
                 r["left"], r["done"] = 0.0, True
     if all(r["done"] for r in pos["rules"].values()):
         trade = {"id": pos["id"], "caller": pos["caller"], "mint": pos["mint"], "mcap": pos["mcap"],
-                 "callout_ms": pos["callout_ms"], "seen_ms": pos["seen_ms"], "hot": pos.get("hot", False),
-                 "entry": pos["entry"], "pnl": {name: round(pnl(r), 2) for name, r in pos["rules"].items()}}
+                 "callout_ms": pos["callout_ms"], "seen_ms": pos["seen_ms"], "via": pos.get("via"),
+                 "author_ok": pos.get("author_ok"), "entry": pos["entry"],
+                 "pnl": {name: round(pnl(r), 2) for name, r in pos["rules"].items()}}
         record("trades.jsonl", trade)
         del state["positions"][pos["id"]]
         log.info("CLOSED %s (%s): %s", pos["mint"], pos["caller"],
@@ -286,17 +329,14 @@ def update(api, state, pos, now_ms):
 
 # ---- what to spend the next request on --------------------------------------------
 
-def pick(state, now_ms, hot):
+def pick(state, now_ms):
     """The most useful next pump.fun request, in this order:
     1. a position about to lose data: a busy coin's last 300 one-second bars
        cover only ~5 minutes, and a paper buy must be priced within 4 minutes
-    2. a caller not checked for OVERDUE_S
-    3. a caller who just spent SOL on-chain (the early warning)
-    4. a paper buy waiting for its price
-    5. a position not checked for a minute
-    6. otherwise, the caller checked longest ago"""
-    def since(c):
-        return now_ms - state["polled"].get(c, 0)
+    2. the site-wide feed, if not polled for FEED_MAX_GAP_S
+    3. a paper buy waiting for its price
+    4. a position not checked for a minute
+    5. otherwise, the feed again"""
     held = [p for p in state["positions"].values() if p["entry"] is not None]
     waiting = [p for p in state["positions"].values() if p["entry"] is None
                and now_ms >= p["seen_ms"] + (EXEC_DELAY_S + 5) * 1000 and now_ms - p["checked_ms"] >= 10_000]
@@ -304,32 +344,118 @@ def pick(state, now_ms, hot):
               + [p for p in waiting if now_ms - p["seen_ms"] >= 120_000])
     if urgent:
         return "position", min(urgent, key=lambda p: p["checked_ms"])
-    for group in ([c for c in CALLERS if since(c) >= OVERDUE_S * 1000], [c for c in CALLERS if hot.get(c, 0) > now_ms]):
-        if group:
-            return "caller", max(group, key=since)
+    if now_ms - state.get("feed_ms", 0) >= FEED_MAX_GAP_S * 1000:
+        return "feed", None
     if waiting:
         return "position", waiting[0]
     stale = [p for p in held if now_ms - p["checked_ms"] >= 60_000]
     if stale:
         return "position", min(stale, key=lambda p: p["checked_ms"])
-    return "caller", max(CALLERS, key=since)
+    return "feed", None
 
 
-def step(api, state, hot):
-    """Wait for pump.fun's next free slot, then spend it on the most useful request."""
+def open_position(state, caller, c, seen_ms, via):
+    state["positions"][c["calloutId"]] = new_position(caller, c, seen_ms, via)
+    log.info("CALLOUT %s -> %s (mcap $%s) via %s, seen %.1fs after posting", caller, c["coinMint"],
+             f"{c.get('marketCap') or 0:,.0f}", via, (seen_ms - c["createdAt"]) / 1000)
+
+
+def step(api, state):
+    """Wait for pump.fun's next free slot, then spend it on the most useful request.
+    Pushed callouts keep the time they arrived, so the wait does not delay the paper buy."""
     api.wait()
+    for caller, c, seen_ms in take_pushed(state):
+        open_position(state, caller, c, seen_ms, "push")
     now_ms = api.now_ms()
-    kind, x = pick(state, now_ms, hot)
+    kind, pos = pick(state, now_ms)
     if kind == "position":
-        update(api, state, x, now_ms)
+        update(api, state, pos, now_ms)
         return
-    was_hot = hot.get(x, 0) > now_ms
-    for c in poll(api, state, x):
-        state["positions"][c["calloutId"]] = new_position(x, c, c["_seen_ms"], was_hot)
-        hot.pop(x, None)    # their callout is in: stop spending requests on them
-        log.info("CALLOUT %s -> %s (mcap $%s), seen %.1fs after posting%s", x, c["coinMint"],
-                 f"{c.get('marketCap') or 0:,.0f}", (c["_seen_ms"] - c["createdAt"]) / 1000,
-                 " (early warning was on)" if was_hot else "")
+    for caller, c, seen_ms in poll_feed(api, state):
+        open_position(state, caller, c, seen_ms, "feed")
+
+
+# ---- the push: pump.fun's live "New" callouts feed (NATS over websocket) ------------
+
+def nats_login():
+    """The website's public live-data login for its CORE cluster, from the homepage."""
+    html = requests.get("https://pump.fun/", headers={"User-Agent": "Mozilla/5.0"}, timeout=20).text
+    m = re.search(r'"CORE":\{[^}]*?"servers":"([^"]+)","user":"([^"]+)","pass":"([^"]+)"', html.replace('\\"', '"'))
+    if not m:
+        raise RuntimeError("pump.fun's homepage no longer carries the NATS login")
+    return m.groups()
+
+
+def nats_parse(buf):
+    """Split received NATS protocol bytes into (message payloads, unparsed rest, PINGs)."""
+    msgs, pings = [], 0
+    while (i := buf.find(b"\r\n")) >= 0:
+        line = buf[:i]
+        if line.startswith((b"MSG ", b"HMSG ")):
+            parts = line.split()
+            size, hdr = int(parts[-1]), int(parts[-2]) if line.startswith(b"HMSG") else 0
+            if len(buf) < i + 2 + size + 2:
+                break                                   # the rest of this message is still coming
+            msgs.append(buf[i + 2 + hdr: i + 2 + size])
+            buf = buf[i + 2 + size + 2:]
+            continue
+        if line == b"PING":
+            pings += 1
+        elif line.startswith(b"-ERR"):
+            raise ConnectionError(line.decode(errors="replace"))
+        buf = buf[i + 2:]
+    return msgs, buf, pings
+
+
+def push_match(row, mints, now_ms):
+    """(caller, callout) when a pushed callout is on a coin one of our callers bought
+    within MINT_WATCH_MIN, else None. The row's token starts with its creation time
+    in microseconds."""
+    hit = mints.get(row.get("coinMint"))
+    if not hit or hit[1] < now_ms:
+        return None
+    created = int(str(row["token"]).split(":")[0]) // 1000
+    if now_ms - created > MAX_CALLOUT_AGE_S * 1000:   # e.g. the snapshot that comes on (re)connect
+        return None
+    return hit[0], {"calloutId": row["calloutId"], "coinMint": row["coinMint"], "createdAt": created,
+                    "marketCap": row.get("calledOutAtMcap")}
+
+
+async def push_watch(mints):
+    """Every new callout on pump.fun within ~1.4 s, as the website's "New" tab gets them.
+    Each message is a snapshot of the newest 25; a callout shows up in several."""
+    import websockets
+    pushed, delay = {}, 1    # callout id -> None, insertion-ordered so the oldest can be dropped
+    while True:
+        try:
+            url, user, pw = await asyncio.to_thread(nats_login)
+            async with websockets.connect(url, open_timeout=15, ping_interval=20, max_size=2**22) as ws:
+                await asyncio.wait_for(ws.recv(), 10)   # the server's INFO: anything sent before it is ignored
+                await ws.send(("CONNECT " + json.dumps({"verbose": False, "pedantic": False, "user": user,
+                                                        "pass": pw, "protocol": 1, "headers": True,
+                                                        "lang": "python", "version": "1"})
+                               + f"\r\nSUB {PUSH_SUBJECT} 1\r\nPING\r\n").encode())
+                log.info("push on: pump.fun's live new-callouts feed")
+                delay, buf = 1, b""
+                while True:
+                    frame = await asyncio.wait_for(ws.recv(), 90)   # a heartbeat comes every ~30 s
+                    msgs, buf, pings = nats_parse(buf + (frame if isinstance(frame, bytes) else frame.encode()))
+                    for _ in range(pings):
+                        await ws.send(b"PONG\r\n")
+                    now_ms = int(time.time() * 1000)
+                    for payload in msgs:
+                        for row in json.loads(payload).get("head") or []:
+                            if row.get("calloutId") in pushed:
+                                continue
+                            pushed[row.get("calloutId")] = None
+                            if (got := push_match(row, mints, now_ms)) is not None:
+                                DETECTED.put((*got, now_ms))
+                    while len(pushed) > 2000:
+                        del pushed[next(iter(pushed))]
+        except Exception as exc:   # nothing secret on this path: the login is public and not in errors
+            log.warning("push dropped (%s: %s); reconnecting in %ds", type(exc).__name__, str(exc)[:120], delay)
+        await asyncio.sleep(delay)
+        delay = min(60, delay * 2)
 
 
 # ---- the early warning: the callers' SOL balances (Helius websocket) ----------------
@@ -349,15 +475,65 @@ def spend(msg, by_sub, last):
     return None
 
 
-async def watch(wss_url, hot):
-    """Mark a caller hot when their wallet spends SOL. Watching their transaction logs
-    instead was tried: other people's failed transactions mention schoen's wallet ~18
-    times a second (~1 GB a day), and Helius bills websocket data at 2 credits per
-    0.1 MB. Balances change only when money actually moves."""
+def received(tx, wallet):
+    """Coins (not wrapped SOL) whose balance rose for `wallet` in a transaction it
+    signed; nothing for someone else's transaction that merely mentions it."""
+    if not any(k.get("pubkey") == wallet and k.get("signer") for k in tx["transaction"]["message"]["accountKeys"]):
+        return set()
+    meta = tx["meta"]
+    before = {b["mint"]: int(b["uiTokenAmount"]["amount"]) for b in meta.get("preTokenBalances") or []
+              if b.get("owner") == wallet}
+    return {b["mint"] for b in meta.get("postTokenBalances") or []
+            if b.get("owner") == wallet and b["mint"] != WSOL
+            and int(b["uiTokenAmount"]["amount"]) > before.get(b["mint"], 0)}
+
+
+def bought_coins(rpc_url, wallet, slot):
+    """What the wallet bought in `slot`. Thousands of other people's transactions
+    mention some of these wallets, so only successful ones in that slot are read."""
+    def rpc(method, params):
+        return requests.post(rpc_url, timeout=10, json={"jsonrpc": "2.0", "id": 1, "method": method,
+                                                        "params": params}).json().get("result")
+    for _ in range(3):
+        recent = rpc("getSignaturesForAddress", [wallet, {"limit": 300, "commitment": "confirmed"}]) or []
+        sigs = [s["signature"] for s in recent if s["slot"] == slot and s.get("err") is None]
+        if sigs:
+            coins = set()
+            for sig in sigs:
+                tx = rpc("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1,
+                                                  "commitment": "confirmed"}])
+                coins |= received(tx, wallet) if tx else set()
+            return coins
+        time.sleep(1)    # not indexed yet
+    return set()
+
+
+async def name_coins(rpc_url, caller, sol, slot, mints):
+    try:
+        coins = await asyncio.to_thread(bought_coins, rpc_url, CALLERS[caller][1], slot)
+    except Exception as exc:   # type only: a requests error message holds the RPC URL and key
+        log.warning("could not read what %s bought (%s)", caller, type(exc).__name__)
+        return
+    until = int(time.time() * 1000) + MINT_WATCH_MIN * 60_000
+    for coin in coins:
+        mints[coin] = (caller, until)
+    for coin, (_, t) in list(mints.items()):
+        if t < time.time() * 1000:
+            del mints[coin]
+    record("spends.jsonl", {"caller": caller, "sol": round(sol, 4), "slot": slot, "coins": sorted(coins),
+                            "seen_ms": int(time.time() * 1000)})
+    log.info("EARLY WARNING: %s spent %.2f SOL on %s; a callout on it counts as theirs for %d min",
+             caller, sol, ", ".join(sorted(coins)) or "no coin found", MINT_WATCH_MIN)
+
+
+async def watch(wss_url, rpc_url, mints):
+    """Watch the callers' wallet balances. Their transaction logs were tried first:
+    other people's failed transactions mention schoen's wallet ~18 times a second
+    (~1 GB a day), and Helius bills websocket data at 2 credits per 0.1 MB."""
     import websockets
     # Balances survive reconnects. ponytail: a caller's first balance change after the bot
     # starts only sets their baseline; seed `last` with getMultipleAccounts if that matters.
-    last, delay = {}, 1
+    last, delay, tasks = {}, 1, set()
     while True:
         try:
             async with websockets.connect(wss_url, open_timeout=15, ping_interval=20) as ws:
@@ -377,19 +553,20 @@ async def watch(wss_url, hot):
                             log.info("wallet watch on: %d wallets", len(by_sub))
                             delay = 1
                     elif got := spend(msg, by_sub, last):
-                        caller, sol = got
-                        now = int(time.time() * 1000)
-                        hot[caller] = now + HOT_MIN * 60_000
-                        record("spends.jsonl", {"caller": caller, "sol": round(sol, 4), "seen_ms": now,
-                                                "slot": msg["params"]["result"]["context"]["slot"]})
-                        log.info("EARLY WARNING: %s spent %.2f SOL on-chain; checking their callouts at full "
-                                 "speed for %d min", caller, sol, HOT_MIN)
+                        task = asyncio.create_task(name_coins(rpc_url, *got, msg["params"]["result"]["context"]["slot"],
+                                                              mints))
+                        tasks.add(task)
+                        task.add_done_callback(tasks.discard)
             why = "closed by the server"
-        except Exception as exc:   # type only: an error message can hold the URL and key
+        except Exception as exc:   # type only: an error message can hold the URL and its key
             why = type(exc).__name__
         log.warning("wallet watch dropped (%s); reconnecting in %ds", why, delay)
         await asyncio.sleep(delay)
         delay = min(60, delay * 2)
+
+
+async def live(wss_url, rpc_url):
+    await asyncio.gather(watch(wss_url, rpc_url, MINTS), push_watch(MINTS))
 
 
 def run():
@@ -401,24 +578,26 @@ def run():
     logging.getLogger("websockets").setLevel(logging.WARNING)
     log.info("PAPER MODE: no wallet, no keys, nothing is ever sent. $%.0f a trade, %d callers, one pump.fun "
              "request per %.0fs; rules: %s", STAKE_USD, len(CALLERS), MIN_GAP_S, "; ".join(RULES))
-    wss = load_env().get("SOLANA_WSS_URL")
-    if wss:
-        threading.Thread(target=asyncio.run, args=(watch(wss, HOT),), name="wallet-watch", daemon=True).start()
+    env = load_env()
+    if env.get("SOLANA_WSS_URL") and env.get("SOLANA_RPC_URL"):
+        threading.Thread(target=asyncio.run, args=(live(env["SOLANA_WSS_URL"], env["SOLANA_RPC_URL"]),),
+                         name="live", daemon=True).start()
     else:
-        log.warning("no SOLANA_WSS_URL in .env: early warning OFF, callouts are seen late")
+        log.warning("no SOLANA_WSS_URL/SOLANA_RPC_URL in .env: push matching OFF, callouts seen in 7-14 s")
     api, state, beat = Api(), load(), 0.0
     try:
         while True:
             try:
-                step(api, state, HOT)
+                step(api, state)
             except Exception:   # logged with its traceback; paper positions stay saved
                 log.exception("step failed; retrying in 5s")
                 time.sleep(5)
             save(state)
             if time.time() - beat >= 900:   # a heartbeat, so a quiet log still shows the bot is alive
                 beat = time.time()
-                log.info("alive: %d open paper positions; early warning on for: %s", len(state["positions"]),
-                         ", ".join(c for c, t in HOT.items() if t > beat * 1000) or "nobody")
+                watched = [f"{c}:{m[:6]}" for m, (c, t) in dict(MINTS).items() if t > beat * 1000]
+                log.info("alive: %d open paper positions; push-matching coins: %s", len(state["positions"]),
+                         ", ".join(watched) or "none yet")
     except KeyboardInterrupt:
         save(state)
         log.info("stopped; %d open paper positions saved", len(state["positions"]))
@@ -431,8 +610,12 @@ def report():
         with open(path, encoding="utf-8") as f:
             trades = [json.loads(line) for line in f]
     print(f"{len(trades)} closed paper trades, {len(load()['positions'])} open, ${STAKE_USD:.0f} each")
-    fast = [t for t in trades if t["seen_ms"] - t["callout_ms"] <= 10_000]
-    for label, group in (("callout seen within 10s", fast), ("callout seen later", [t for t in trades if t not in fast])):
+    wrong = [t for t in trades if t.get("author_ok") is False]
+    if wrong:
+        print(f"{len(wrong)} pushed callouts turned out to be someone else's; they are left out below")
+    good = [t for t in trades if t.get("author_ok") is not False]
+    fast = [t for t in good if t["seen_ms"] - t["callout_ms"] <= 5_000]
+    for label, group in (("callout seen within 5s", fast), ("callout seen later", [t for t in good if t not in fast])):
         if group:
             print(f"\n{label}: {len(group)} trades")
         for name in RULES:
@@ -440,12 +623,12 @@ def report():
             if xs:
                 print(f"  {name:<36} wins {sum(x > 0 for x in xs):>3}/{len(xs):<3}  total {sum(xs):+9.2f}  "
                       f"avg {sum(xs) / len(xs):+7.2f}")
-    for label, group in (("with early warning", [t for t in trades if t.get("hot")]),
-                         ("without", [t for t in trades if not t.get("hot")])):
-        lag = sorted((t["seen_ms"] - t["callout_ms"]) / 1000 for t in group)
+    for via in ("push", "feed", None):
+        lag = sorted((t["seen_ms"] - t["callout_ms"]) / 1000 for t in good if t.get("via") == via)
         if lag:
-            print(f"\ncallout seen after posting, {label}: median {statistics.median(lag):.1f}s, "
-                  f"p95 {lag[int(0.95 * (len(lag) - 1))]:.1f}s, max {lag[-1]:.1f}s  (n={len(lag)})")
+            print(f"\ncallout seen after posting, via {via or 'the old per-caller list'}: median "
+                  f"{statistics.median(lag):.1f}s, p95 {lag[int(0.95 * (len(lag) - 1))]:.1f}s, max {lag[-1]:.1f}s"
+                  f"  (n={len(lag)})")
 
 
 if __name__ == "__main__":
