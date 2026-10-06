@@ -611,13 +611,17 @@ def run():
     else:
         log.warning("no SOLANA_WSS_URL/SOLANA_RPC_URL in .env: push matching OFF, callouts seen in 7-14 s")
     api, state, beat = Api(), load(), 0.0
-    now = time.time() * 1000      # strangers' callouts, and push matches the feed can no longer confirm
-    drop = [k for k, p in state["positions"].items() if p.get("author_ok") is False
-            or (p.get("via") == "push" and p.get("author_ok") is None and now - p["callout_ms"] > 300_000)]
+    # Unconfirmed push positions from before the size check (no size_ratio) were mostly strangers'
+    # callouts, and ones older than the feed's window can never be confirmed. Wrong matches that
+    # passed the size check stay: a live bot would have bought them too.
+    now = time.time() * 1000
+    drop = [k for k, p in state["positions"].items() if p.get("via") == "push" and p.get("author_ok") is not True
+            and (p.get("size_ratio") is None or (p.get("author_ok") is None and now - p["callout_ms"] > 300_000))]
     for k in drop:
         del state["positions"][k]
     if drop:
-        log.info("dropped %d open paper positions: strangers' callouts, or callers never confirmed", len(drop))
+        log.info("dropped %d open paper positions: unchecked matches from before the size check, or callers "
+                 "the feed can no longer confirm", len(drop))
     try:
         while True:
             try:
@@ -648,6 +652,9 @@ def report():
     if wrong or unsure:
         print(f"left out below: {wrong} pushed callouts that were strangers', {unsure} whose caller was never "
               f"confirmed")
+    passed = [t["pnl"].get(next(iter(RULES))) for t in trades if t.get("author_ok") is False and t.get("size_ratio")]
+    if passed:   # these slipped past the size check: a live bot would have bought them too
+        print(f"strangers' callouts that passed the size check: {len(passed)}, main rule total {sum(passed):+.2f}")
     good = [t for t in trades if t.get("author_ok", True) is True]   # older trades predate the check
     ratios = sorted(t["size_ratio"] for t in good if t.get("size_ratio"))
     if ratios:
