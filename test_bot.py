@@ -42,8 +42,8 @@ class FakeApi:
     """Serves the feed and candles like pump.fun (candles: the last `count` bars up
     to `to`) on a fake clock; records every request."""
 
-    def __init__(self, feed=None, candles=None, now_ms=0, takes_ms=0):
-        self.feed, self.candles, self.calls = feed or [], candles or [], []
+    def __init__(self, feed=None, candles=None, now_ms=0, takes_ms=0, sol=120.0):
+        self.feed, self.candles, self.calls, self.sol = feed or [], candles or [], [], sol
         self.t, self.takes_ms = now_ms, takes_ms
 
     def wait(self):
@@ -57,6 +57,8 @@ class FakeApi:
         self.t += self.takes_ms
         if path == "/home-feed/new":
             return {"coins": self.feed}
+        if path == "/sol-price":
+            return {"solPrice": self.sol}
         width = 1000 if params["res"] == "1s" else 60_000
         rows = [b for b in self.candles if b[1] == width and b[0] <= params["to"]][-params["count"]:]
         return {"candles": [{"openTimeMs": t, "open": str(o), "high": str(h), "low": str(l), "close": str(c),
@@ -134,13 +136,16 @@ class Feed(unittest.TestCase):
         self.assertEqual(state["feed_ms"], now)
         self.assertEqual(bot.poll_feed(api, state), [])     # the same callouts again: nothing
 
-    def test_the_feed_settles_who_made_a_pushed_callout(self):
+    def test_the_feed_settles_who_made_a_pushed_callout_and_rewatches_a_wrong_match(self):
+        watch = ["schoen", self.NOW + 60_000, 10.0]
         state = {"seen": {"x": 0, "y": 0}, "positions": {
-            "x": bot.new_position("schoen", {"calloutId": "x", "coinMint": "M", "createdAt": 0}, 0, "push"),
-            "y": bot.new_position("schoen", {"calloutId": "y", "coinMint": "N", "createdAt": 0}, 0, "push")}}
+            "x": bot.new_position("schoen", {"calloutId": "x", "coinMint": "M", "createdAt": 0, "watch": watch}, 0, "push"),
+            "y": bot.new_position("schoen", {"calloutId": "y", "coinMint": "N", "createdAt": 0, "watch": watch}, 0, "push")}}
         rows = [feed_row("x", PROFILE["schoen"], "M", self.NOW - 5_000), feed_row("y", "copycat", "N", self.NOW - 5_000)]
+        bot.MINTS.clear()
         bot.poll_feed(FakeApi(feed=rows, now_ms=self.NOW), state)
         self.assertEqual((state["positions"]["x"]["author_ok"], state["positions"]["y"]["author_ok"]), (True, False))
+        self.assertEqual(bot.MINTS, {"N": tuple(watch)})     # schoen's own callout on N may still come
 
     def test_seen_list_keeps_the_newest_5000_however_old(self):
         state = {"seen": {f"s{i}": i for i in range(5_000)}, "positions": {}}
@@ -163,15 +168,24 @@ class Push(unittest.TestCase):
         with self.assertRaises(ConnectionError):
             bot.nats_parse(b"-ERR 'Authorization Violation'\r\n")
 
-    def test_a_fresh_pushed_callout_on_a_coin_a_caller_just_bought_is_theirs(self):
-        now = 1_000_000_000
-        row = {"calloutId": "x", "coinMint": "CoinA", "token": f"{(now - 1_500) * 1000}:x", "calledOutAtMcap": 40_000}
-        mints = {"CoinA": ("schoen", now + 60_000)}
-        caller, c = bot.push_match(row, mints, now)
-        self.assertEqual((caller, c["calloutId"], c["createdAt"], c["marketCap"]), ("schoen", "x", now - 1_500, 40_000))
-        self.assertIsNone(bot.push_match(dict(row, coinMint="CoinB"), mints, now))            # nobody bought it
-        self.assertIsNone(bot.push_match(row, {"CoinA": ("schoen", now - 1)}, now))           # bought too long ago
-        self.assertIsNone(bot.push_match(dict(row, token=f"{(now - 61_000) * 1000}:x"), mints, now))  # old: snapshot
+    def test_only_a_position_the_size_of_the_callers_spend_matches_and_only_once(self):
+        now, sol_usd = 1_000_000_000, 120.0
+        row = {"calloutId": "x", "coinMint": "CoinA", "token": f"{(now - 1_500) * 1000}:x", "calledOutAtMcap": 40_000,
+               "costBasisUsd": 1_150.0}                                           # schoen spent 10 SOL = $1,200
+
+        def watch():
+            return {"CoinA": ("schoen", now + 60_000, 10.0)}
+        for other in (dict(row, costBasisUsd=357), dict(row, costBasisUsd=5_000),   # strangers' positions
+                      dict(row, coinMint="CoinB"),                                   # nobody we watch bought it
+                      dict(row, token=f"{(now - 61_000) * 1000}:x")):                # old: the snapshot on connect
+            self.assertIsNone(bot.push_match(other, watch(), now, sol_usd))
+        self.assertIsNone(bot.push_match(row, watch(), now, None))                  # no SOL price yet
+        self.assertIsNone(bot.push_match(row, {"CoinA": ("schoen", now - 1, 10.0)}, now, sol_usd))   # watch over
+        mints = watch()
+        caller, c = bot.push_match(row, mints, now, sol_usd)
+        self.assertEqual((caller, c["calloutId"], c["createdAt"], c["size_ratio"], c["watch"]),
+                         ("schoen", "x", now - 1_500, 0.958, ["schoen", now + 60_000, 10.0]))
+        self.assertEqual(mints, {})                       # pump.fun allows one callout per user per coin
 
     def test_pushed_callouts_are_taken_once(self):
         state = {"seen": {"dup": 1}, "positions": {}}
@@ -203,7 +217,7 @@ class Scheduler(unittest.TestCase):
 
         def callout(i, ago_s):
             return {"calloutId": i, "coinMint": "M" + i, "createdAt": now - ago_s * 1000}
-        state = {"seen": {}, "feed_ms": now - 20_000, "positions": {
+        state = {"seen": {}, "feed_ms": now - 20_000, "sol_ms": now - 700_000, "positions": {
             "late": bot.new_position("ily", callout("late", 131), now - 130_000, "push"),   # unpriced for 2 min
             "c1": position(checked_ms=now - 250_000),        # its 300-bar window is nearly gone
             "p": bot.new_position("marcell", callout("p", 9), now - 8_000, "push"),        # landed; price is in
@@ -211,15 +225,15 @@ class Scheduler(unittest.TestCase):
             "s": dict(position(checked_ms=now - 70_000), id="s"),
             "q": dict(position(checked_ms=now - 10_000), id="q"),   # no trade for ages, but just checked
         }}
-        order = [("position", "late"), ("position", "c1"), ("feed", None), ("position", "p"), ("position", "s"),
-                 ("feed", None)]
+        order = [("feed", None), ("position", "late"), ("position", "c1"), ("sol", None), ("position", "p"),
+                 ("position", "s"), ("feed", None)]
         for want in order:
             kind, x = bot.pick(state, now)
             self.assertEqual((kind, x["id"] if kind == "position" else x), want)
             if kind == "position":
                 del state["positions"][x["id"]]
             else:
-                state["feed_ms"] = now
+                state[f"{kind}_ms"] = now
 
 
 class WalletWatch(unittest.TestCase):
@@ -251,9 +265,10 @@ class EndToEnd(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             bot.STATE_DIR = d
             t0 = 2_000_000_000
-            mints = {"MintX": ("marcell", t0 + 3_600_000)}                 # marcell just bought MintX on-chain
-            row = {"calloutId": "x1", "coinMint": "MintX", "token": f"{(t0 - 1_000) * 1000}:x1", "calledOutAtMcap": 9e4}
-            bot.DETECTED.put((*bot.push_match(row, mints, t0), t0))        # pushed 1 s after posting
+            mints = {"MintX": ("marcell", t0 + 3_600_000, 10.0)}           # marcell just spent 10 SOL on MintX
+            row = {"calloutId": "x1", "coinMint": "MintX", "token": f"{(t0 - 1_000) * 1000}:x1", "calledOutAtMcap": 9e4,
+                   "costBasisUsd": 1_190.0}
+            bot.DETECTED.put((*bot.push_match(row, mints, t0, 120.0), t0))   # pushed 1 s after posting
             api = FakeApi(now_ms=t0 + 1_000, feed=[feed_row("x1", PROFILE["marcell"], "MintX", t0 - 1_000)],
                           candles=[bar(t0 // 1000, 1.0, 1.02, 1.0, 1.01), bar(t0 // 1000 + 1, 1.01, 1.05, 1.0, 1.04)])
             state = bot.load()
@@ -262,6 +277,8 @@ class EndToEnd(unittest.TestCase):
             bot.save(state)
             state = bot.load()                                  # a restart in between
             api.t = t0 + 8_000
+            bot.step(api, state)                                # the SOL price, which push matching needs
+            self.assertEqual(bot.PRICE["sol"], 120.0)
             bot.step(api, state)                                # the paper buy, at the window high
             self.assertEqual(state["positions"]["x1"]["entry"], 1.05)
             api.candles.append(bar(t0 // 1000 + 4, 1.1, 2.3, 1.1, 2.2))
@@ -270,7 +287,8 @@ class EndToEnd(unittest.TestCase):
             bot.step(api, state)                                # ...then the routine check: every target reached
             self.assertEqual(state["positions"], {})
             trade = read_trade(d)
-            self.assertEqual((trade["via"], trade["author_ok"], trade["seen_ms"] - trade["callout_ms"]), ("push", True, 1000))
+            self.assertEqual((trade["via"], trade["author_ok"], trade["seen_ms"] - trade["callout_ms"], trade["size_ratio"]),
+                             ("push", True, 1000, 0.992))
             self.assertTrue(all(v > 0 for v in trade["pnl"].values()), trade["pnl"])
 
 

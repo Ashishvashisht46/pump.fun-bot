@@ -65,7 +65,10 @@ MIN_GAP_S = float(os.getenv("PUMP_MIN_GAP_S", "7"))   # one pump.fun request per
 FEED_MAX_GAP_S = 14      # the site-wide feed is polled at least this often
 SPEND_SOL = 0.05         # a wallet dropping more than this bought something; fees are far smaller,
                          # and all 32 buys before a callout in the study were 0.084 SOL or more
-MINT_WATCH_MIN = 60      # a pushed callout on a coin a caller bought this recently is theirs
+MINT_WATCH_MIN = 60      # a pushed callout on a coin a caller bought this recently can be theirs...
+SIZE_BAND = (0.7, 1.4)   # ...if the caller's position in the row is this many times what we saw them
+                         # spend. Strangers calling the same coins held $1-$357 against schoen's $240-$6,630;
+                         # site-wide, the median callout position is $37 and 2.6% are $500+ (2026-10-06)
 LIMIT_MIN = 60           # anything still held after this is sold at the market
 
 RULES = {  # name: ([(fraction to sell, at this multiple of our fill)], stop multiple)
@@ -76,8 +79,9 @@ RULES = {  # name: ([(fraction to sell, at this multiple of our fill)], stop mul
 }
 
 log = logging.getLogger("callout-bot")
-MINTS = {}                 # coin -> (caller, unix ms until which a callout on it counts as theirs)
+MINTS = {}                 # coin -> (caller, unix ms the watch ends, SOL they spent on it)
 DETECTED = queue.Queue()   # (caller, callout, arrival ms) from the push thread to the main loop
+PRICE = {}                 # "sol": USD, from pump.fun, refreshed every 10 min by the main loop
 
 
 class Api:
@@ -193,6 +197,8 @@ def poll_feed(api, state):
             if not p["author_ok"]:
                 log.warning("the pushed callout on %s was by %s, not %s; trade kept, marked wrong",
                             p["mint"], pos.get("userName") or "someone else", p["caller"])
+                if p.get("watch"):              # their own callout on it may still come
+                    MINTS[p["mint"]] = tuple(p["watch"])
         if caller is None or cid in state["seen"]:
             continue
         created = int(datetime.fromisoformat(c["calloutTimestamp"].replace("Z", "+00:00")).timestamp() * 1000)
@@ -222,6 +228,7 @@ def take_pushed(state):
 def new_position(caller, c, seen_ms, via):
     return {"id": c["calloutId"], "caller": caller, "mint": c["coinMint"], "callout_ms": c["createdAt"],
             "seen_ms": seen_ms, "via": via, "author_ok": True if via == "feed" else None,
+            "watch": c.get("watch"), "size_ratio": c.get("size_ratio"),
             "mcap": c.get("marketCap"), "entry": None, "tokens": None,
             "last_bar_ms": None, "last_close": None, "checked_ms": 0,
             "rules": {name: {"left": 1.0, "hit": [False] * len(legs), "proceeds": 0.0, "sells": 0, "done": False}
@@ -319,7 +326,7 @@ def update(api, state, pos, now_ms):
     if all(r["done"] for r in pos["rules"].values()):
         trade = {"id": pos["id"], "caller": pos["caller"], "mint": pos["mint"], "mcap": pos["mcap"],
                  "callout_ms": pos["callout_ms"], "seen_ms": pos["seen_ms"], "via": pos.get("via"),
-                 "author_ok": pos.get("author_ok"), "entry": pos["entry"],
+                 "author_ok": pos.get("author_ok"), "size_ratio": pos.get("size_ratio"), "entry": pos["entry"],
                  "pnl": {name: round(pnl(r), 2) for name, r in pos["rules"].items()}}
         record("trades.jsonl", trade)
         del state["positions"][pos["id"]]
@@ -331,21 +338,25 @@ def update(api, state, pos, now_ms):
 
 def pick(state, now_ms):
     """The most useful next pump.fun request, in this order:
-    1. a position about to lose data: a busy coin's last 300 one-second bars
+    1. the site-wide feed, if not polled for FEED_MAX_GAP_S: it finds callouts and
+       confirms push matches, so positions never starve it
+    2. a position about to lose data: a busy coin's last 300 one-second bars
        cover only ~5 minutes, and a paper buy must be priced within 4 minutes
-    2. the site-wide feed, if not polled for FEED_MAX_GAP_S
-    3. a paper buy waiting for its price
-    4. a position not checked for a minute
-    5. otherwise, the feed again"""
+    3. the SOL price, if 10 minutes old (push matching needs it)
+    4. a paper buy waiting for its price
+    5. a position not checked for a minute
+    6. otherwise, the feed again"""
     held = [p for p in state["positions"].values() if p["entry"] is not None]
     waiting = [p for p in state["positions"].values() if p["entry"] is None
                and now_ms >= p["seen_ms"] + (EXEC_DELAY_S + 5) * 1000 and now_ms - p["checked_ms"] >= 10_000]
     urgent = ([p for p in held if now_ms - p["checked_ms"] >= 240_000]
               + [p for p in waiting if now_ms - p["seen_ms"] >= 120_000])
-    if urgent:
-        return "position", min(urgent, key=lambda p: p["checked_ms"])
     if now_ms - state.get("feed_ms", 0) >= FEED_MAX_GAP_S * 1000:
         return "feed", None
+    if urgent:
+        return "position", min(urgent, key=lambda p: p["checked_ms"])
+    if now_ms - state.get("sol_ms", 0) >= 600_000:
+        return "sol", None
     if waiting:
         return "position", waiting[0]
     stale = [p for p in held if now_ms - p["checked_ms"] >= 60_000]
@@ -356,8 +367,9 @@ def pick(state, now_ms):
 
 def open_position(state, caller, c, seen_ms, via):
     state["positions"][c["calloutId"]] = new_position(caller, c, seen_ms, via)
-    log.info("CALLOUT %s -> %s (mcap $%s) via %s, seen %.1fs after posting", caller, c["coinMint"],
-             f"{c.get('marketCap') or 0:,.0f}", via, (seen_ms - c["createdAt"]) / 1000)
+    log.info("CALLOUT %s -> %s (mcap $%s) via %s, seen %.1fs after posting%s", caller, c["coinMint"],
+             f"{c.get('marketCap') or 0:,.0f}", via, (seen_ms - c["createdAt"]) / 1000,
+             f"; their position is {c['size_ratio']:.2f}x what they spent" if c.get("size_ratio") else "")
 
 
 def step(api, state):
@@ -370,9 +382,14 @@ def step(api, state):
     kind, pos = pick(state, now_ms)
     if kind == "position":
         update(api, state, pos, now_ms)
-        return
-    for caller, c, seen_ms in poll_feed(api, state):
-        open_position(state, caller, c, seen_ms, "feed")
+    elif kind == "sol":
+        state["sol_ms"] = now_ms
+        price = (api.get("/sol-price", {}) or {}).get("solPrice")
+        if price:
+            PRICE["sol"] = float(price)
+    else:
+        for caller, c, seen_ms in poll_feed(api, state):
+            open_position(state, caller, c, seen_ms, "feed")
 
 
 # ---- the push: pump.fun's live "New" callouts feed (NATS over websocket) ------------
@@ -407,18 +424,25 @@ def nats_parse(buf):
     return msgs, buf, pings
 
 
-def push_match(row, mints, now_ms):
-    """(caller, callout) when a pushed callout is on a coin one of our callers bought
-    within MINT_WATCH_MIN, else None. The row's token starts with its creation time
-    in microseconds."""
+def push_match(row, mints, now_ms, sol_usd):
+    """(caller, callout) when a pushed callout is the caller's own, else None. A row
+    names the coin, not the caller, and strangers call the same coins all the time:
+    it counts only if the coin is one the caller bought within MINT_WATCH_MIN and the
+    row's position is the size of what they spent. pump.fun allows one callout per
+    user per coin, so a match ends the watch (poll_feed restores it if the match
+    proves wrong). The token starts with the creation time in microseconds."""
     hit = mints.get(row.get("coinMint"))
-    if not hit or hit[1] < now_ms:
+    if not hit or hit[1] < now_ms or not sol_usd:
         return None
     created = int(str(row["token"]).split(":")[0]) // 1000
     if now_ms - created > MAX_CALLOUT_AGE_S * 1000:   # e.g. the snapshot that comes on (re)connect
         return None
+    ratio = (row.get("costBasisUsd") or 0) / (hit[2] * sol_usd)
+    if not SIZE_BAND[0] <= ratio <= SIZE_BAND[1]:
+        return None
+    del mints[row["coinMint"]]
     return hit[0], {"calloutId": row["calloutId"], "coinMint": row["coinMint"], "createdAt": created,
-                    "marketCap": row.get("calledOutAtMcap")}
+                    "marketCap": row.get("calledOutAtMcap"), "watch": list(hit), "size_ratio": round(ratio, 3)}
 
 
 async def push_watch(mints):
@@ -448,7 +472,7 @@ async def push_watch(mints):
                             if row.get("calloutId") in pushed:
                                 continue
                             pushed[row.get("calloutId")] = None
-                            if (got := push_match(row, mints, now_ms)) is not None:
+                            if (got := push_match(row, mints, now_ms, PRICE.get("sol"))) is not None:
                                 DETECTED.put((*got, now_ms))
                     while len(pushed) > 2000:
                         del pushed[next(iter(pushed))]
@@ -514,11 +538,13 @@ async def name_coins(rpc_url, caller, sol, slot, mints):
     except Exception as exc:   # type only: a requests error message holds the RPC URL and key
         log.warning("could not read what %s bought (%s)", caller, type(exc).__name__)
         return
-    until = int(time.time() * 1000) + MINT_WATCH_MIN * 60_000
-    for coin in coins:
-        mints[coin] = (caller, until)
-    for coin, (_, t) in list(mints.items()):
-        if t < time.time() * 1000:
+    now = int(time.time() * 1000)
+    for coin in coins:   # several coins in one slot: split the SOL evenly (rare)
+        prev = mints.get(coin)
+        before = prev[2] if prev and prev[0] == caller and prev[1] >= now else 0
+        mints[coin] = (caller, now + MINT_WATCH_MIN * 60_000, before + sol / len(coins))
+    for coin, (_, t, _) in list(mints.items()):
+        if t < now:
             del mints[coin]
     record("spends.jsonl", {"caller": caller, "sol": round(sol, 4), "slot": slot, "coins": sorted(coins),
                             "seen_ms": int(time.time() * 1000)})
@@ -585,6 +611,13 @@ def run():
     else:
         log.warning("no SOLANA_WSS_URL/SOLANA_RPC_URL in .env: push matching OFF, callouts seen in 7-14 s")
     api, state, beat = Api(), load(), 0.0
+    now = time.time() * 1000      # strangers' callouts, and push matches the feed can no longer confirm
+    drop = [k for k, p in state["positions"].items() if p.get("author_ok") is False
+            or (p.get("via") == "push" and p.get("author_ok") is None and now - p["callout_ms"] > 300_000)]
+    for k in drop:
+        del state["positions"][k]
+    if drop:
+        log.info("dropped %d open paper positions: strangers' callouts, or callers never confirmed", len(drop))
     try:
         while True:
             try:
@@ -595,7 +628,7 @@ def run():
             save(state)
             if time.time() - beat >= 900:   # a heartbeat, so a quiet log still shows the bot is alive
                 beat = time.time()
-                watched = [f"{c}:{m[:6]}" for m, (c, t) in dict(MINTS).items() if t > beat * 1000]
+                watched = [f"{c}:{m[:6]}" for m, (c, t, _) in dict(MINTS).items() if t > beat * 1000]
                 log.info("alive: %d open paper positions; push-matching coins: %s", len(state["positions"]),
                          ", ".join(watched) or "none yet")
     except KeyboardInterrupt:
@@ -610,10 +643,16 @@ def report():
         with open(path, encoding="utf-8") as f:
             trades = [json.loads(line) for line in f]
     print(f"{len(trades)} closed paper trades, {len(load()['positions'])} open, ${STAKE_USD:.0f} each")
-    wrong = [t for t in trades if t.get("author_ok") is False]
-    if wrong:
-        print(f"{len(wrong)} pushed callouts turned out to be someone else's; they are left out below")
-    good = [t for t in trades if t.get("author_ok") is not False]
+    wrong = sum(t.get("author_ok") is False for t in trades)
+    unsure = sum("author_ok" in t and t["author_ok"] is None for t in trades)
+    if wrong or unsure:
+        print(f"left out below: {wrong} pushed callouts that were strangers', {unsure} whose caller was never "
+              f"confirmed")
+    good = [t for t in trades if t.get("author_ok", True) is True]   # older trades predate the check
+    ratios = sorted(t["size_ratio"] for t in good if t.get("size_ratio"))
+    if ratios:
+        print(f"confirmed push matches: position/spend ratio {ratios[0]:.2f}-{ratios[-1]:.2f}, "
+              f"median {statistics.median(ratios):.2f} (band {SIZE_BAND[0]}-{SIZE_BAND[1]})")
     fast = [t for t in good if t["seen_ms"] - t["callout_ms"] <= 5_000]
     for label, group in (("callout seen within 5s", fast), ("callout seen later", [t for t in good if t not in fast])):
         if group:
