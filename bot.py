@@ -28,6 +28,11 @@ How it sees a callout within ~2 s:
   pump.fun allows ~8-10 requests a minute; the bot makes at most 7, 3 s apart, so a
   confirmation usually goes out at once. The per-caller /callout/list showed a
   callout ~38 s late and is no longer used.
+- EVM: marcell and ily also call coins on EVM chains (marcell's are BSC coins from
+  the Flap launchpad, addresses ending 7777). The feed covers every chain and prices
+  come from the same API by chain id. There is no EVM wallet watch, so the push alarm
+  for EVM is a big position instead: an EVM callout with $300+ behind it makes the
+  bot ask the feed at once; smaller ones wait for the 20 s poll.
 """
 import asyncio
 import collections
@@ -52,7 +57,15 @@ STATE_DIR = os.path.join(HERE, "state")
 API = "https://frontend-api-v3.pump.fun"
 SOL = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
 WSOL = "So11111111111111111111111111111111111111112"
-PUSH_SUBJECT = "homeFeedNew.head.solana.prod"
+CHAINS = {  # pump.fun's chain names -> the CAIP-2 ids its price API takes (from its frontend)
+    "solana": SOL, "ethereum": "eip155:1", "base": "eip155:8453", "bsc": "eip155:56",
+    "robinhood": "eip155:4663", "hyperevm": "eip155:999", "arc": "eip155:5042",
+}
+PUSH_SUBJECTS = ("homeFeedNew.head.solana.prod",   # Solana callouts
+                 "homeFeedNew.head.all.prod")      # every chain: adds the EVM ones, ~0.3 s behind
+PUSH_SILENCE_S = 60      # a snapshot comes every ~2 s, a heartbeat every ~30 s: this long without one means a
+                         # dead subscription (seen twice: a fresh one got nothing for minutes while the server's
+                         # PINGs kept the connection looking alive)
 
 CALLERS = {  # name: (pump.fun profile id, Solana wallet)
     "marcell": ("240b8242-5715-492e-828c-1622aac53376", "6vbrTLsWy76TxDQAUKLqZrPohQuq6EVaJgfGzR82paFa"),
@@ -77,6 +90,9 @@ MINT_WATCH_MIN = 60      # a pushed callout on a coin a caller bought this recen
 SIZE_BAND = (0.5, 2.0)   # ...if the row's position is this many times what they spent: worth asking the
                          # feed. Most strangers hold far less (median callout position $37), but copy-
                          # traders hold the same: 14 strangers on schoen's coins were 0.70-1.23x (2026-10-06)
+EVM_ALARM_USD = 300      # no wallet watch on EVM chains, and ~5 EVM callouts a minute site-wide are too many
+                         # to ask the feed about: only those with a position this big (top ~10% site-wide;
+                         # marcell's Solana buys run in the thousands) get asked about at once
 LIMIT_MIN = 60           # anything still held after this is sold at the market
 
 RULES = {  # name: ([(fraction to sell, at this multiple of our fill)], stop multiple)
@@ -199,7 +215,7 @@ def poll_feed(api, state):
     site-wide "New" feed, which lists every position-backed callout with its caller,
     newest first. via is "push" when the push alarm asked for this poll. It also
     settles every pending push alarm: found (ours or a stranger's), or given up."""
-    d = api.get("/home-feed/new", {"pageSize": 50, "chain": "solana"})
+    d = api.get("/home-feed/new", {"pageSize": 50, "chain": "all"})
     now_ms = api.now_ms()
     state["feed_ms"] = now_ms
     out = []
@@ -207,7 +223,7 @@ def poll_feed(api, state):
         pos = row.get("position") or {}
         c = pos.get("callout") or {}
         cid, caller = c.get("calloutId"), BY_PROFILE.get(pos.get("userId"))
-        if not cid or not c.get("calloutTimestamp"):
+        if not cid or not c.get("calloutTimestamp") or row.get("chain") not in CHAINS:
             continue
         alarm = PENDING.pop(cid, None)
         if caller is None or cid in state["seen"]:
@@ -219,8 +235,8 @@ def poll_feed(api, state):
             log.info("%s callout %s is %.0fs old; not buying", caller, row["coinMint"], age)
             continue
         out.append((caller, {"calloutId": cid, "coinMint": row["coinMint"], "createdAt": created,
-                             "marketCap": c.get("calledOutAtMcap"), "size_ratio": alarm and alarm[1]},
-                    "push" if alarm else "feed", now_ms))
+                             "chain": CHAINS[row["chain"]], "marketCap": c.get("calledOutAtMcap"),
+                             "size_ratio": alarm and alarm[1]}, "push" if alarm else "feed", now_ms))
     for cid, (give_up, _) in list(PENDING.items()):
         if give_up < now_ms:
             del PENDING[cid]
@@ -241,8 +257,9 @@ def take_pushed(state, now_ms):
 
 
 def new_position(caller, c, seen_ms, via):
-    return {"id": c["calloutId"], "caller": caller, "mint": c["coinMint"], "callout_ms": c["createdAt"],
-            "seen_ms": seen_ms, "via": via, "author_ok": True, "size_ratio": c.get("size_ratio"),
+    return {"id": c["calloutId"], "caller": caller, "mint": c["coinMint"], "chain": c.get("chain", SOL),
+            "callout_ms": c["createdAt"], "seen_ms": seen_ms, "via": via, "author_ok": True,
+            "size_ratio": c.get("size_ratio"),
             "mcap": c.get("marketCap"), "entry": None, "tokens": None,
             "last_bar_ms": None, "last_close": None, "checked_ms": 0,
             "rules": {name: {"left": 1.0, "hit": [False] * len(legs), "proceeds": 0.0, "sells": 0, "done": False}
@@ -251,10 +268,10 @@ def new_position(caller, c, seen_ms, via):
 
 # ---- prices and exits ------------------------------------------------------------
 
-def bars(api, mint, to_ms, count, res="1s"):
+def bars(api, chain, mint, to_ms, count, res="1s"):
     """The last `count` bars up to to_ms, oldest first. Only periods with trades
     have a bar, so 300 one-second bars can span 5 minutes or an hour."""
-    d = api.get(f"/candles/{SOL}/{mint}", {"res": res, "measure": "price_usd", "to": to_ms, "count": count})
+    d = api.get(f"/candles/{chain}/{mint}", {"res": res, "measure": "price_usd", "to": to_ms, "count": count})
     width = 1000 if res == "1s" else 60_000
     return [(b["openTimeMs"], width, float(b["open"]), float(b["high"]), float(b["low"]), float(b["close"]),
              b.get("final", True)) for b in (d or {}).get("candles") or []]
@@ -309,7 +326,7 @@ def update(api, state, pos, now_ms):
     position needs a request only every few minutes: late is fine, as long as no
     second is skipped."""
     pos["checked_ms"] = now_ms
-    bs = bars(api, pos["mint"], now_ms, 300)
+    bs = bars(api, pos.get("chain", SOL), pos["mint"], now_ms, 300)
     if pos["entry"] is None:                      # the paper buy
         landed = pos["seen_ms"] + EXEC_DELAY_S * 1000
         price = fill_price(bs, pos["seen_ms"], landed)
@@ -325,7 +342,8 @@ def update(api, state, pos, now_ms):
                  pos.get("via", "list"))
     elif len(bs) == 300 and bs[0][0] > pos["last_bar_ms"] + 1000:
         # 300 busy seconds since the last look: minute bars instead, coarser but nothing skipped
-        bs = bars(api, pos["mint"], now_ms, min(300, math.ceil((now_ms - pos["last_bar_ms"]) / 60_000) + 1), "1m")
+        bs = bars(api, pos.get("chain", SOL), pos["mint"], now_ms,
+                  min(300, math.ceil((now_ms - pos["last_bar_ms"]) / 60_000) + 1), "1m")
     for b in bs:
         end = b[0] + b[1] - 1000   # a minute bar's last second
         if end > pos["last_bar_ms"] and b[6]:   # final bars only: a forming bar can still move
@@ -340,7 +358,8 @@ def update(api, state, pos, now_ms):
                      f"{LIMIT_MIN}-min limit (no trade since)")
                 r["left"], r["done"] = 0.0, True
     if all(r["done"] for r in pos["rules"].values()):
-        trade = {"id": pos["id"], "caller": pos["caller"], "mint": pos["mint"], "mcap": pos["mcap"],
+        trade = {"id": pos["id"], "caller": pos["caller"], "mint": pos["mint"], "chain": pos.get("chain", SOL),
+                 "mcap": pos["mcap"],
                  "callout_ms": pos["callout_ms"], "seen_ms": pos["seen_ms"], "via": pos.get("via"),
                  "author_ok": pos.get("author_ok"), "size_ratio": pos.get("size_ratio"), "entry": pos["entry"],
                  "entry_ms": pos["entry_ms"], "tokens": pos["tokens"],
@@ -462,6 +481,18 @@ def push_match(row, mints, now_ms, sol_usd):
                     "marketCap": row.get("calledOutAtMcap"), "size_ratio": round(ratio, 3)}
 
 
+def evm_alarm(row, now_ms):
+    """The callout, when a pushed EVM callout (whose caller nothing tells us) has a
+    position of EVM_ALARM_USD or more: worth asking the feed about at once. Smaller
+    ones wait for the routine feed poll."""
+    if CHAINS.get(row.get("chain"), SOL) == SOL or (row.get("costBasisUsd") or 0) < EVM_ALARM_USD:
+        return None
+    created = int(str(row["token"]).split(":")[0]) // 1000
+    if now_ms - created > MAX_CALLOUT_AGE_S * 1000:
+        return None
+    return {"calloutId": row["calloutId"], "coinMint": row["coinMint"], "createdAt": created}
+
+
 async def push_watch(mints):
     """Every new callout on pump.fun within ~1.4 s, as the website's "New" tab gets them.
     Each message is a snapshot of the newest 25; a callout shows up in several."""
@@ -475,14 +506,19 @@ async def push_watch(mints):
                 await ws.send(("CONNECT " + json.dumps({"verbose": False, "pedantic": False, "user": user,
                                                         "pass": pw, "protocol": 1, "headers": True,
                                                         "lang": "python", "version": "1"})
-                               + f"\r\nSUB {PUSH_SUBJECT} 1\r\nPING\r\n").encode())
-                log.info("push on: pump.fun's live new-callouts feed")
-                delay, buf = 1, b""
+                               + "".join(f"\r\nSUB {s} {i}" for i, s in enumerate(PUSH_SUBJECTS, 1))
+                               + "\r\nPING\r\n").encode())
+                log.info("push on: pump.fun's live new-callouts feeds (Solana, and every chain)")
+                delay, buf, last_msg = 1, b"", time.time()
                 while True:
-                    frame = await asyncio.wait_for(ws.recv(), 90)   # a heartbeat comes every ~30 s
+                    frame = await asyncio.wait_for(ws.recv(), PUSH_SILENCE_S)
                     msgs, buf, pings = nats_parse(buf + (frame if isinstance(frame, bytes) else frame.encode()))
                     for _ in range(pings):
                         await ws.send(b"PONG\r\n")
+                    if msgs:
+                        last_msg = time.time()
+                    elif time.time() - last_msg > PUSH_SILENCE_S:
+                        raise ConnectionError(f"nothing pushed for {PUSH_SILENCE_S} s")
                     now_ms = int(time.time() * 1000)
                     for payload in msgs:
                         for row in json.loads(payload).get("head") or []:
@@ -491,6 +527,8 @@ async def push_watch(mints):
                             pushed[row.get("calloutId")] = None
                             if (got := push_match(row, mints, now_ms, PRICE.get("sol"))) is not None:
                                 DETECTED.put((*got, now_ms))
+                            elif (c := evm_alarm(row, now_ms)) is not None:
+                                DETECTED.put((None, c, now_ms))
                     while len(pushed) > 2000:
                         del pushed[next(iter(pushed))]
         except Exception as exc:   # nothing secret on this path: the login is public and not in errors
@@ -671,8 +709,9 @@ def history():
     """Every trade on a confirmed callout: the buy, each sell with its fee and tip,
     and the result per rule. Also writes state/history.csv (one row per buy or sell;
     its net column adds up to each trade's result)."""
-    rows = [["trade", "callout", "caller", "coin", "via", "seen_after_s", "rule", "action", "time", "share",
+    rows = [["trade", "callout", "caller", "chain", "coin", "via", "seen_after_s", "rule", "action", "time", "share",
              "multiple", "price_usd", "value_usd", "fee_usd", "tip_usd", "net_usd", "reason"]]
+    chain_name = {caip2: name for name, caip2 in CHAINS.items()}
     trades = [t for t in read_trades() if t.get("author_ok", True) is True]   # older trades predate the check
 
     def when(ms):
@@ -682,9 +721,10 @@ def history():
         entry, lag = t["entry"], (t["seen_ms"] - t["callout_ms"]) / 1000
         tokens = t.get("tokens") or STAKE_USD * (1 - COST) / entry
         bought = t.get("entry_ms") or t["seen_ms"] + EXEC_DELAY_S * 1000
-        head = [n, when(t["callout_ms"]), t["caller"], t["mint"], t.get("via") or "list", round(lag, 1)]
-        print(f"\n#{n} {when(t['callout_ms'])}  {t['caller']} called {t['mint']} at ${t.get('mcap') or 0:,.0f} "
-              f"market cap; seen {lag:.1f}s later via {t.get('via') or 'the old per-caller list'}")
+        chain = chain_name.get(t.get("chain", SOL), t.get("chain"))
+        head = [n, when(t["callout_ms"]), t["caller"], chain, t["mint"], t.get("via") or "list", round(lag, 1)]
+        print(f"\n#{n} {when(t['callout_ms'])}  {t['caller']} called {t['mint']} ({chain}) at "
+              f"${t.get('mcap') or 0:,.0f} market cap; seen {lag:.1f}s later via {t.get('via') or 'the old per-caller list'}")
         print(f"   BUY  {when(bought)}  ${STAKE_USD:.2f} = fee ${STAKE_USD * COST:.2f} + ${STAKE_USD * (1 - COST):.2f}"
               f" for {tokens:,.0f} tokens at ${entry:.4g}; tip ${TIP_USD:.2f}")
         for name, result in t["pnl"].items():

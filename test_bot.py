@@ -2,16 +2,19 @@
 
     .venv\\Scripts\\python.exe -m unittest test_bot -v
 """
+import asyncio
 import collections
 import contextlib
 import csv
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest import mock
 
 import bot
 
@@ -35,10 +38,10 @@ def bar(t_s, o, h, l, c, final=True):
     return (t_s * 1000, 1000, o, h, l, c, final)
 
 
-def feed_row(cid, profile, mint, created_ms, mcap=50_000):
+def feed_row(cid, profile, mint, created_ms, mcap=50_000, chain="solana"):
     """A /home-feed/new row as pump.fun serves it (only the fields the bot reads)."""
     ts = datetime.fromtimestamp(created_ms / 1000, timezone.utc).isoformat().replace("+00:00", "Z")
-    return {"coinMint": mint, "position": {"userId": profile, "userName": "someone", "callout": {
+    return {"coinMint": mint, "chain": chain, "position": {"userId": profile, "userName": "someone", "callout": {
         "calloutId": cid, "calledOutAtMcap": mcap, "calloutTimestamp": ts}}}
 
 
@@ -59,8 +62,8 @@ class FakeApi:
     def get(self, path, params):
         self.calls.append((path, params))
         self.t += self.takes_ms
-        if path == "/home-feed/new":
-            return {"coins": self.feed}
+        if path == "/home-feed/new":   # like pump.fun: chain=all, or one chain's rows only
+            return {"coins": [r for r in self.feed if params.get("chain") in ("all", r.get("chain"))]}
         if path == "/sol-price":
             return {"solPrice": self.sol}
         width = 1000 if params["res"] == "1s" else 60_000
@@ -154,6 +157,17 @@ class Feed(unittest.TestCase):
                          [("schoen", "ours", "push", 0.98)])
         self.assertEqual(set(bot.PENDING), {"not-yet"})      # a stranger's is settled; an old alarm given up
 
+    def test_evm_callouts_by_our_callers_count_on_supported_chains(self):
+        now = self.NOW
+        rows = [feed_row("b", PROFILE["marcell"], "0xB88a", now - 2_000, chain="bsc"),
+                feed_row("m", PROFILE["ily"], "0xM0n", now - 2_000, chain="monad")]       # no price data: skipped
+        got = bot.poll_feed(FakeApi(feed=rows, now_ms=now), {"seen": {}, "positions": {}})
+        self.assertEqual([(caller, c["coinMint"], c["chain"]) for caller, c, _, _ in got], [("marcell", "0xB88a", "eip155:56")])
+        p = bot.new_position("marcell", got[0][1], now, "feed")
+        api = FakeApi(now_ms=now + 8_000)
+        bot.update(api, {"seen": {}, "positions": {"b": p}}, p, now + 8_000)
+        self.assertEqual(api.calls[0][0], "/candles/eip155:56/0xB88a")   # its own chain's prices
+
     def test_seen_list_keeps_the_newest_5000_however_old(self):
         state = {"seen": {f"s{i}": i for i in range(5_000)}, "positions": {}}
         bot.remember(state, "new", 10**13)
@@ -191,6 +205,17 @@ class Push(unittest.TestCase):
         caller, c = bot.push_match(row, watch(), now, sol_usd)
         self.assertEqual((caller, c["calloutId"], c["createdAt"], c["size_ratio"]), ("schoen", "x", now - 1_500, 0.958))
 
+    def test_an_evm_alarm_needs_a_fresh_callout_with_a_big_position(self):
+        now = 1_000_000_000
+        row = {"calloutId": "e", "coinMint": "0xC0in", "chain": "bsc", "token": f"{(now - 1_000) * 1000}:e",
+               "costBasisUsd": 2_500.0}
+        self.assertEqual(bot.evm_alarm(row, now), {"calloutId": "e", "coinMint": "0xC0in", "createdAt": now - 1_000})
+        for other in (dict(row, costBasisUsd=120),                                  # small: the routine poll will do
+                      dict(row, chain="solana"),                                    # Solana has its own alarm
+                      dict(row, chain="monad"),                                     # no price data
+                      dict(row, token=f"{(now - 61_000) * 1000}:e")):               # old: the snapshot on connect
+            self.assertIsNone(bot.evm_alarm(other, now))
+
     def test_push_alarms_wait_for_the_feed_unless_already_seen(self):
         bot.PENDING.clear()
         state = {"seen": {"dup": 1}, "positions": {}}
@@ -200,6 +225,45 @@ class Push(unittest.TestCase):
         self.assertEqual(bot.PENDING, {"new": (16_000, 0.9)})
         self.assertEqual(state["positions"], {})            # nothing is bought on the push alone
         self.assertFalse(bot.take_pushed(state, 2_000))
+
+
+class PushWatchdog(unittest.TestCase):
+    def test_a_subscription_that_only_gets_pings_is_reconnected(self):
+        connects = []
+
+        class SilentSocket:     # the server answers, but no callout snapshot ever comes
+            def __init__(self):
+                self.frames = 0
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def recv(self):
+                self.frames += 1
+                await asyncio.sleep(0.01)
+                return b'INFO {"server_id":"x"}\r\n' if self.frames == 1 else b"PING\r\n"
+
+            async def send(self, data):
+                pass
+
+        def connect(*args, **kwargs):
+            connects.append(1)
+            return SilentSocket()
+
+        async def run_briefly():
+            try:
+                await asyncio.wait_for(bot.push_watch({}), 1.5)
+            except asyncio.TimeoutError:
+                pass
+        with mock.patch.dict(sys.modules, {"websockets": SimpleNamespace(connect=connect)}), \
+                mock.patch.object(bot, "nats_login", return_value=("wss://x", "u", "p")), \
+                mock.patch.object(bot, "PUSH_SILENCE_S", 0.1), \
+                contextlib.redirect_stderr(io.StringIO()):
+            asyncio.run(run_briefly())
+        self.assertGreaterEqual(len(connects), 2)
 
 
 class Pacing(unittest.TestCase):
