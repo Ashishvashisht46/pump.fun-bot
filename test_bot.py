@@ -11,11 +11,12 @@ from types import SimpleNamespace
 import bot
 
 ENTRY, TOKENS = 1.0, bot.STAKE_USD * (1 - bot.COST)       # a fill at $1.00 buys 98 tokens
+PROFILE = {name: ids[0] for name, ids in bot.CALLERS.items()}
 
 
 def position(**kw):
-    p = bot.new_position("schoen", {"calloutId": "c1", "coinMint": "Mint1", "createdAt": 0}, 0)
-    p.update(entry=ENTRY, entry_ms=0, tokens=TOKENS, last_bar_ms=0, last_close=ENTRY, **kw)
+    p = bot.new_position("schoen", {"calloutId": "c1", "coinMint": "Mint1", "createdAt": 0}, 0, False)
+    p.update({"entry": ENTRY, "entry_ms": 0, "tokens": TOKENS, "last_bar_ms": 0, "last_close": ENTRY, **kw})
     return p
 
 
@@ -29,17 +30,28 @@ def bar(t_s, o, h, l, c, final=True):
 
 
 class FakeApi:
-    """Serves callout lists and candles from dicts; records every request."""
+    """Serves callout lists and candles like pump.fun (the last `count` bars up to
+    `to`) on a fake clock; records every request."""
 
-    def __init__(self, callouts=None, candles=None):
+    def __init__(self, callouts=None, candles=None, now_ms=0, takes_ms=0):
         self.callouts, self.candles, self.calls = callouts or {}, candles or [], []
+        self.t, self.takes_ms = now_ms, takes_ms
+
+    def wait(self):
+        pass
+
+    def now_ms(self):
+        return self.t
 
     def get(self, path, params):
         self.calls.append((path, params))
+        self.t += self.takes_ms
         if path.startswith("/callout/list/"):
             return {"callouts": self.callouts.get(path.rsplit("/", 1)[1], [])}
+        width = 1000 if params["res"] == "1s" else 60_000
+        rows = [b for b in self.candles if b[1] == width and b[0] <= params["to"]][-params["count"]:]
         return {"candles": [{"openTimeMs": t, "open": str(o), "high": str(h), "low": str(l), "close": str(c),
-                             "final": f} for (t, w, o, h, l, c, f) in self.candles if t <= params["to"]]}
+                             "final": f} for (t, w, o, h, l, c, f) in rows]}
 
 
 class ExitRules(unittest.TestCase):
@@ -71,7 +83,7 @@ class ExitRules(unittest.TestCase):
         self.assertAlmostEqual(p["rules"]["all at 2x"]["proceeds"], TOKENS * 1.05 * (1 - bot.COST))
 
     def test_a_coin_nobody_trades_still_closes_after_the_limit(self):
-        state = {"seen": {}, "positions": {"c1": position()}}
+        state = {"seen": {}, "polled": {}, "positions": {"c1": position()}}
         with tempfile.TemporaryDirectory() as d:
             bot.STATE_DIR = d
             bot.update(FakeApi(), state, state["positions"]["c1"], (bot.LIMIT_MIN + 2) * 60_000)
@@ -80,17 +92,35 @@ class ExitRules(unittest.TestCase):
             self.assertAlmostEqual(trade["pnl"]["all at 2x"], TOKENS * (1 - bot.COST) - bot.STAKE_USD - 2 * bot.TIP_USD,
                                    places=2)
 
+    def test_falling_behind_a_busy_coin_falls_back_to_minute_bars(self):
+        p = position(checked_ms=0, last_bar_ms=30_000)                         # seen up to second 30
+        state = {"seen": {}, "polled": {}, "positions": {"c1": p}}
+        busy = [bar(400 + i, 1.1, 1.1, 1.1, 1.1) for i in range(300)]          # the last 300 seconds all traded
+        minutes = [(m * 60_000, 60_000, 1.0, 1.0, 0.6 if m == 0 else 1.0, 1.0, True) for m in range(12)]
+        bot.update(FakeApi(candles=busy + minutes), state, p, 720_000)
+        # the stop broke in minute 0, partly seen and before those 300 seconds: it must not be skipped
+        self.assertAlmostEqual(p["rules"]["all at 2x"]["proceeds"], TOKENS * 0.7 * (1 - bot.COST))
+
 
 class Callouts(unittest.TestCase):
-    def test_only_new_fresh_solana_callouts_are_bought(self):
+    def test_only_new_fresh_solana_callouts_are_bought_timed_when_the_answer_arrives(self):
         now = 1_000_000
         fresh = {"calloutId": "a", "coinMint": "SoLMint", "createdAt": now - 3_000}
         old = {"calloutId": "b", "coinMint": "OldMint", "createdAt": now - 120_000}
         evm = {"calloutId": "c", "coinMint": "0xabc", "createdAt": now - 1_000}
-        api = FakeApi(callouts={bot.CALLERS["schoen"]: [fresh, old, evm]})
-        state = {"seen": {}, "positions": {}}
-        self.assertEqual([c["calloutId"] for c in bot.poll(api, state, "schoen", now)], ["a"])
-        self.assertEqual(bot.poll(api, state, "schoen", now), [])     # the same callouts again: nothing
+        api = FakeApi(callouts={PROFILE["schoen"]: [fresh, old, evm]}, now_ms=now - 400, takes_ms=400)
+        state = {"seen": {}, "positions": {}, "polled": {}}
+        got = bot.poll(api, state, "schoen")
+        self.assertEqual([(c["calloutId"], c["_seen_ms"]) for c in got], [("a", now)])
+        self.assertEqual(state["polled"]["schoen"], now)
+        self.assertEqual(bot.poll(api, state, "schoen"), [])     # the same callouts again: nothing
+
+    def test_seen_list_keeps_the_newest_5000_however_old(self):
+        state = {"seen": {f"s{i}": i for i in range(5_001)}, "positions": {}, "polled": {}}
+        bot.poll(FakeApi(now_ms=10**13), state, "ily")
+        self.assertEqual(len(state["seen"]), 5_000)
+        self.assertNotIn("s0", state["seen"])
+        self.assertIn("s1", state["seen"])
 
     def test_buy_pays_the_highest_price_between_seeing_and_landing(self):
         bs = [bar(9, 1.0, 1.1, 0.9, 1.0), bar(10, 1.0, 1.3, 1.0, 1.2), bar(11, 1.2, 1.25, 1.1, 1.2),
@@ -116,25 +146,75 @@ class Pacing(unittest.TestCase):
         self.assertGreaterEqual(slept[-1], 15)
 
 
+class Scheduler(unittest.TestCase):
+    def test_the_priority_order(self):
+        now = 10_000_000
+        polled = {c: now - 5_000 for c in bot.CALLERS}
+        polled["SoloFNF"] = now - 20_000          # checked longest ago, but not overdue
+        polled["pxblocito"] = now - 200_000       # overdue
+        hot = {"ily": now + 60_000}               # just bought on-chain
+
+        def callout(i, ago_s):
+            return {"calloutId": i, "coinMint": "M" + i, "createdAt": now - ago_s * 1000}
+        state = {"seen": {}, "polled": polled, "positions": {
+            "late": bot.new_position("ily", callout("late", 131), now - 130_000, True),   # unpriced for 2 min
+            "c1": position(checked_ms=now - 250_000),        # its 300-bar window is nearly gone
+            "p": bot.new_position("marcell", callout("p", 9), now - 8_000, False),       # landed; price is in
+            "early": bot.new_position("schoen", callout("early", 3), now - 2_000, False),  # too soon to price
+            "s": dict(position(checked_ms=now - 70_000), id="s"),
+            "q": dict(position(checked_ms=now - 10_000), id="q"),   # no trade for ages, but just checked
+        }}
+        order = [("position", "late"), ("position", "c1"), ("caller", "pxblocito"), ("caller", "ily"),
+                 ("position", "p"), ("position", "s"), ("caller", "SoloFNF")]
+        for want in order:
+            kind, x = bot.pick(state, now, hot)
+            self.assertEqual((kind, x["id"] if kind == "position" else x), want)
+            if kind == "position":
+                del state["positions"][x["id"]]
+            else:
+                polled[x] = now
+                hot.pop(x, None)
+
+
+class WalletWatch(unittest.TestCase):
+    def test_only_a_drop_bigger_than_fees_in_a_callers_balance_counts(self):
+        def note(sol, sub=7):
+            return {"method": "accountNotification", "params": {"subscription": sub, "result": {
+                "context": {"slot": 1}, "value": {"lamports": int(sol * 1e9)}}}}
+        subs, last = {7: "schoen"}, {}
+        self.assertIsNone(bot.spend(note(10), subs, last))                    # the first balance is a baseline
+        self.assertIsNone(bot.spend(note(9.995), subs, last))                 # a fee
+        self.assertIsNone(bot.spend(note(10.5), subs, last))                  # money in: a payout or a sale
+        self.assertEqual(bot.spend(note(8.5), subs, last), ("schoen", 2.0))   # they bought something
+        self.assertIsNone(bot.spend(note(1, sub=8), subs, last))              # not a caller's wallet
+        self.assertIsNone(bot.spend({"jsonrpc": "2.0", "result": 7, "id": 1}, subs, last))   # a reply
+
+
 class EndToEnd(unittest.TestCase):
-    def test_callout_to_paper_buy_to_recorded_trade_and_restart_keeps_it(self):
+    def test_early_warned_callout_to_paper_buy_to_recorded_trade_across_a_restart(self):
         with tempfile.TemporaryDirectory() as d:
             bot.STATE_DIR = d
             t0 = 2_000_000
             call = {"calloutId": "x1", "coinMint": "MintX", "createdAt": t0 - 2_000, "marketCap": 300_000}
-            api = FakeApi(callouts={bot.CALLERS["marcell"]: [call]},
+            api = FakeApi(callouts={PROFILE["marcell"]: [call]}, now_ms=t0,
                           candles=[bar(t0 // 1000, 1.0, 1.02, 1.0, 1.01), bar(t0 // 1000 + 1, 1.01, 1.05, 1.0, 1.04)])
-            state = {"seen": {}, "positions": {}, "next_caller": 0}
-            bot.step(api, state, 0, t0)                         # marcell's callout is seen
-            self.assertIn("x1", state["positions"])
+            state = bot.load()
+            state["polled"] = {c: t0 for c in bot.CALLERS}     # everyone was just checked...
+            hot = {"marcell": t0 + 600_000}                     # ...but marcell just bought on-chain
+            bot.step(api, state, hot)                           # so marcell is asked, and the callout is in
+            self.assertTrue(state["positions"]["x1"]["hot"])
+            self.assertNotIn("marcell", hot)
             bot.save(state)
-            state = bot.load()                                   # a restart in between
-            bot.step(api, state, 1, t0 + 3_000)                  # the paper buy, at the window high
+            state = bot.load()                                  # a restart in between
+            api.t = t0 + 8_000
+            bot.step(api, state, hot)                           # the paper buy, at the window high
             self.assertEqual(state["positions"]["x1"]["entry"], 1.05)
             api.candles.append(bar(t0 // 1000 + 4, 1.1, 2.3, 1.1, 2.2))
-            bot.step(api, state, 3, t0 + 7_000)                  # every target reached
+            api.t = t0 + 75_000
+            bot.step(api, state, hot)                           # the routine check: every target reached
             self.assertEqual(state["positions"], {})
             trade = read_trade(d)
+            self.assertTrue(trade["hot"])
             self.assertTrue(all(v > 0 for v in trade["pnl"].values()), trade["pnl"])
 
 
