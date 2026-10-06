@@ -684,7 +684,7 @@ def report():
         lag = sorted((t["seen_ms"] - t["callout_ms"]) / 1000 for t in good if t.get("via") == via)
         if lag:
             print(f"\ncallout seen after posting, via {via or 'the old per-caller list'}: median "
-                  f"{statistics.median(lag):.1f}s, p95 {lag[int(0.95 * (len(lag) - 1))]:.1f}s, max {lag[-1]:.1f}s"
+                  f"{statistics.median(lag):.1f}s, p95 {lag[math.ceil(0.95 * len(lag)) - 1]:.1f}s, max {lag[-1]:.1f}s"
                   f"  (n={len(lag)})")
 
 
