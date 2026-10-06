@@ -123,6 +123,9 @@ class ExitRules(unittest.TestCase):
 class Feed(unittest.TestCase):
     NOW = 1_000_000_000
 
+    def setUp(self):
+        bot.PENDING.clear()
+
     def test_only_our_callers_fresh_callouts_timed_when_the_answer_arrives(self):
         now = self.NOW
         rows = [feed_row("a", PROFILE["schoen"], "MintA", now - 3_000),
@@ -131,21 +134,20 @@ class Feed(unittest.TestCase):
         api = FakeApi(feed=rows, now_ms=now - 400, takes_ms=400)
         state = {"seen": {}, "positions": {}}
         got = bot.poll_feed(api, state)
-        self.assertEqual([(caller, c["calloutId"], c["createdAt"], t) for caller, c, t in got],
-                         [("schoen", "a", now - 3_000, now)])
+        self.assertEqual([(caller, c["calloutId"], c["createdAt"], via, t) for caller, c, via, t in got],
+                         [("schoen", "a", now - 3_000, "feed", now)])
         self.assertEqual(state["feed_ms"], now)
         self.assertEqual(bot.poll_feed(api, state), [])     # the same callouts again: nothing
 
-    def test_the_feed_settles_who_made_a_pushed_callout_and_rewatches_a_wrong_match(self):
-        watch = ["schoen", self.NOW + 60_000, 10.0]
-        state = {"seen": {"x": 0, "y": 0}, "positions": {
-            "x": bot.new_position("schoen", {"calloutId": "x", "coinMint": "M", "createdAt": 0, "watch": watch}, 0, "push"),
-            "y": bot.new_position("schoen", {"calloutId": "y", "coinMint": "N", "createdAt": 0, "watch": watch}, 0, "push")}}
-        rows = [feed_row("x", PROFILE["schoen"], "M", self.NOW - 5_000), feed_row("y", "copycat", "N", self.NOW - 5_000)]
-        bot.MINTS.clear()
-        bot.poll_feed(FakeApi(feed=rows, now_ms=self.NOW), state)
-        self.assertEqual((state["positions"]["x"]["author_ok"], state["positions"]["y"]["author_ok"]), (True, False))
-        self.assertEqual(bot.MINTS, {"N": tuple(watch)})     # schoen's own callout on N may still come
+    def test_the_feed_settles_push_alarms(self):
+        now = self.NOW
+        bot.PENDING.update({"ours": (now + 9_000, 0.98), "stranger": (now + 9_000, 1.02),
+                            "not-yet": (now + 9_000, 1.0), "gone": (now - 1, 1.0)})
+        rows = [feed_row("ours", PROFILE["schoen"], "M", now - 2_000), feed_row("stranger", "copycat", "M", now - 2_000)]
+        got = bot.poll_feed(FakeApi(feed=rows, now_ms=now), {"seen": {}, "positions": {}})
+        self.assertEqual([(caller, c["calloutId"], via, c["size_ratio"]) for caller, c, via, _ in got],
+                         [("schoen", "ours", "push", 0.98)])
+        self.assertEqual(set(bot.PENDING), {"not-yet"})      # a stranger's is settled; an old alarm given up
 
     def test_seen_list_keeps_the_newest_5000_however_old(self):
         state = {"seen": {f"s{i}": i for i in range(5_000)}, "positions": {}}
@@ -168,31 +170,31 @@ class Push(unittest.TestCase):
         with self.assertRaises(ConnectionError):
             bot.nats_parse(b"-ERR 'Authorization Violation'\r\n")
 
-    def test_only_a_position_the_size_of_the_callers_spend_matches_and_only_once(self):
+    def test_an_alarm_needs_a_watched_coin_and_a_position_the_size_of_the_spend(self):
         now, sol_usd = 1_000_000_000, 120.0
         row = {"calloutId": "x", "coinMint": "CoinA", "token": f"{(now - 1_500) * 1000}:x", "calledOutAtMcap": 40_000,
                "costBasisUsd": 1_150.0}                                           # schoen spent 10 SOL = $1,200
 
         def watch():
             return {"CoinA": ("schoen", now + 60_000, 10.0)}
-        for other in (dict(row, costBasisUsd=357), dict(row, costBasisUsd=5_000),   # strangers' positions
+        for other in (dict(row, costBasisUsd=357), dict(row, costBasisUsd=5_000),   # far off the spend
                       dict(row, coinMint="CoinB"),                                   # nobody we watch bought it
                       dict(row, token=f"{(now - 61_000) * 1000}:x")):                # old: the snapshot on connect
             self.assertIsNone(bot.push_match(other, watch(), now, sol_usd))
         self.assertIsNone(bot.push_match(row, watch(), now, None))                  # no SOL price yet
         self.assertIsNone(bot.push_match(row, {"CoinA": ("schoen", now - 1, 10.0)}, now, sol_usd))   # watch over
-        mints = watch()
-        caller, c = bot.push_match(row, mints, now, sol_usd)
-        self.assertEqual((caller, c["calloutId"], c["createdAt"], c["size_ratio"], c["watch"]),
-                         ("schoen", "x", now - 1_500, 0.958, ["schoen", now + 60_000, 10.0]))
-        self.assertEqual(mints, {})                       # pump.fun allows one callout per user per coin
+        caller, c = bot.push_match(row, watch(), now, sol_usd)
+        self.assertEqual((caller, c["calloutId"], c["createdAt"], c["size_ratio"]), ("schoen", "x", now - 1_500, 0.958))
 
-    def test_pushed_callouts_are_taken_once(self):
+    def test_push_alarms_wait_for_the_feed_unless_already_seen(self):
+        bot.PENDING.clear()
         state = {"seen": {"dup": 1}, "positions": {}}
         bot.DETECTED.put(("schoen", {"calloutId": "dup", "coinMint": "M", "createdAt": 1}, 5))
-        bot.DETECTED.put(("schoen", {"calloutId": "new", "coinMint": "M", "createdAt": 1}, 5))
-        self.assertEqual([c["calloutId"] for _, c, _ in bot.take_pushed(state)], ["new"])
-        self.assertIn("new", state["seen"])
+        bot.DETECTED.put(("schoen", {"calloutId": "new", "coinMint": "M", "createdAt": 1, "size_ratio": 0.9}, 5))
+        self.assertTrue(bot.take_pushed(state, 1_000))
+        self.assertEqual(bot.PENDING, {"new": (16_000, 0.9)})
+        self.assertEqual(state["positions"], {})            # nothing is bought on the push alone
+        self.assertFalse(bot.take_pushed(state, 2_000))
 
 
 class Pacing(unittest.TestCase):
@@ -210,6 +212,19 @@ class Pacing(unittest.TestCase):
         self.assertEqual(api.get("/x", {}), {"ok": 1})
         self.assertGreaterEqual(slept[-1], 15)
 
+    def test_at_most_7_requests_a_minute_3_seconds_apart(self):
+        clock = SimpleNamespace(t=0.0)
+        times = []
+
+        def sleep(s):
+            clock.t += s
+        ok = SimpleNamespace(status_code=200, text="", json=lambda: {})
+        api = bot.Api(session=SimpleNamespace(get=lambda *a, **k: times.append(clock.t) or ok),
+                      clock=lambda: clock.t, sleep=sleep)
+        for _ in range(9):
+            api.get("/x", {})
+        self.assertEqual(times, [0, 3, 6, 9, 12, 15, 18, 60, 63])   # the 8th waits for the 1st to age out
+
 
 class Scheduler(unittest.TestCase):
     def test_the_priority_order(self):
@@ -217,23 +232,27 @@ class Scheduler(unittest.TestCase):
 
         def callout(i, ago_s):
             return {"calloutId": i, "coinMint": "M" + i, "createdAt": now - ago_s * 1000}
-        state = {"seen": {}, "feed_ms": now - 20_000, "sol_ms": now - 700_000, "positions": {
-            "late": bot.new_position("ily", callout("late", 131), now - 130_000, "push"),   # unpriced for 2 min
+        state = {"seen": {}, "feed_ms": now - 5_000, "sol_ms": now - 700_000, "positions": {
+            "late": bot.new_position("ily", callout("late", 131), now - 130_000, "feed"),   # unpriced for 2 min
             "c1": position(checked_ms=now - 250_000),        # its 300-bar window is nearly gone
-            "p": bot.new_position("marcell", callout("p", 9), now - 8_000, "push"),        # landed; price is in
-            "early": bot.new_position("schoen", callout("early", 3), now - 2_000, "push"),  # too soon to price
-            "s": dict(position(checked_ms=now - 70_000), id="s"),
+            "p": bot.new_position("marcell", callout("p", 9), now - 8_000, "feed"),        # landed; price is in
+            "early": bot.new_position("schoen", callout("early", 3), now - 2_000, "feed"),  # too soon to price
+            "s": dict(position(checked_ms=now - 130_000), id="s"),
             "q": dict(position(checked_ms=now - 10_000), id="q"),   # no trade for ages, but just checked
         }}
-        order = [("feed", None), ("position", "late"), ("position", "c1"), ("sol", None), ("position", "p"),
-                 ("position", "s"), ("feed", None)]
+        pending = {"x": (now + 9_000, 1.0)}
+        self.assertEqual(bot.pick(state, now, pending), ("feed", None))      # a push alarm: ask the feed now
+        self.assertEqual(bot.pick(state, now, {})[0], "position")            # no alarm, feed polled 5 s ago
+        order = [("position", "late"), ("position", "c1"), ("sol", None), ("position", "p"), ("position", "s"),
+                 (None, None)]                                               # then stay idle
         for want in order:
-            kind, x = bot.pick(state, now)
+            kind, x = bot.pick(state, now, {})
             self.assertEqual((kind, x["id"] if kind == "position" else x), want)
             if kind == "position":
                 del state["positions"][x["id"]]
-            else:
+            elif kind:
                 state[f"{kind}_ms"] = now
+        self.assertEqual(bot.pick(state, now + 20_000, {}), ("feed", None))  # and the feed every 20 s
 
 
 class WalletWatch(unittest.TestCase):
@@ -261,35 +280,38 @@ class WalletWatch(unittest.TestCase):
 
 
 class EndToEnd(unittest.TestCase):
-    def test_pushed_callout_to_paper_buy_to_confirmed_trade_across_a_restart(self):
+    def test_push_alarm_to_feed_confirmed_paper_buy_to_trade_across_a_restart(self):
         with tempfile.TemporaryDirectory() as d:
             bot.STATE_DIR = d
+            bot.PENDING.clear()
             t0 = 2_000_000_000
-            mints = {"MintX": ("marcell", t0 + 3_600_000, 10.0)}           # marcell just spent 10 SOL on MintX
             row = {"calloutId": "x1", "coinMint": "MintX", "token": f"{(t0 - 1_000) * 1000}:x1", "calledOutAtMcap": 9e4,
-                   "costBasisUsd": 1_190.0}
-            bot.DETECTED.put((*bot.push_match(row, mints, t0, 120.0), t0))   # pushed 1 s after posting
-            api = FakeApi(now_ms=t0 + 1_000, feed=[feed_row("x1", PROFILE["marcell"], "MintX", t0 - 1_000)],
+                   "costBasisUsd": 1_188.0}
+            alarm = bot.push_match(row, {"MintX": ("marcell", t0 + 3_600_000, 10.0)}, t0, 120.0)
+            bot.DETECTED.put((*alarm, t0))                       # pushed 1 s after posting
+            api = FakeApi(now_ms=t0, takes_ms=800, feed=[feed_row("x1", PROFILE["marcell"], "MintX", t0 - 1_000)],
                           candles=[bar(t0 // 1000, 1.0, 1.02, 1.0, 1.01), bar(t0 // 1000 + 1, 1.01, 1.05, 1.0, 1.04)])
             state = bot.load()
-            bot.step(api, state)                                # takes the push, then the feed confirms the caller
-            self.assertEqual((state["positions"]["x1"]["via"], state["positions"]["x1"]["author_ok"]), ("push", True))
+            self.assertTrue(bot.step(api, state))                # the alarm makes it ask the feed at once
+            p = state["positions"]["x1"]
+            self.assertEqual((p["via"], p["author_ok"], p["seen_ms"], p["size_ratio"]), ("push", True, t0 + 800, 0.99))
             bot.save(state)
-            state = bot.load()                                  # a restart in between
-            api.t = t0 + 8_000
-            bot.step(api, state)                                # the SOL price, which push matching needs
+            state = bot.load()                                   # a restart in between
+            api.t = t0 + 9_000
+            bot.step(api, state)                                 # the SOL price, which the alarm's size check needs
             self.assertEqual(bot.PRICE["sol"], 120.0)
-            bot.step(api, state)                                # the paper buy, at the window high
+            bot.step(api, state)                                 # the paper buy, at the window high
             self.assertEqual(state["positions"]["x1"]["entry"], 1.05)
             api.candles.append(bar(t0 // 1000 + 4, 1.1, 2.3, 1.1, 2.2))
-            api.t = t0 + 75_000
-            bot.step(api, state)                                # the feed is due first...
-            bot.step(api, state)                                # ...then the routine check: every target reached
+            api.t = t0 + 140_000
+            bot.step(api, state)                                 # the feed is due first...
+            bot.step(api, state)                                 # ...then the routine check: every target reached
             self.assertEqual(state["positions"], {})
             trade = read_trade(d)
             self.assertEqual((trade["via"], trade["author_ok"], trade["seen_ms"] - trade["callout_ms"], trade["size_ratio"]),
-                             ("push", True, 1000, 0.992))
+                             ("push", True, 1_800, 0.99))
             self.assertTrue(all(v > 0 for v in trade["pnl"].values()), trade["pnl"])
+            self.assertFalse(bot.step(api, state))               # nothing left to ask: stay idle
 
 
 if __name__ == "__main__":

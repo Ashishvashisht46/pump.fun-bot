@@ -17,13 +17,18 @@ How it sees a callout within ~2 s:
   is in the homepage HTML). Measured over 179 callouts on 2026-10-06: they arrived
   0.4-2.9 s after posting, median 1.4 s. A pushed row names the coin, not the caller.
 - EARLY WARNING: the callers' SOL balances (Helius websocket in .env). A drop over
-  0.05 SOL means the caller bought; one RPC lookup names the coin. A pushed callout
-  on a coin one of our callers bought in the last hour is taken as theirs.
-- FEED: GET /home-feed/new lists the newest callouts site-wide with their callers.
-  Polled every 7-14 s (pump.fun allows ~8-10 requests a minute), it catches what the
-  push match misses and confirms the caller of every push match. The per-caller
-  /callout/list showed a callout ~38 s late and is no longer used.
+  0.05 SOL means the caller bought; one RPC lookup names the coin.
+- FEED: GET /home-feed/new lists the newest callouts site-wide WITH their callers,
+  and is fresh. A pushed callout on a coin one of our callers just bought makes the
+  bot ask the feed at once; a position opens only when the feed shows the callout is
+  theirs. (Taking the push alone opened 94 positions on strangers' callouts in an
+  hour: copy-traders mirror these callers' buys, at the same size, and call the same
+  coins.) The feed is also polled every 20 s for callouts the push alarm misses.
+  pump.fun allows ~8-10 requests a minute; the bot makes at most 7, 3 s apart, so a
+  confirmation usually goes out at once. The per-caller /callout/list showed a
+  callout ~38 s late and is no longer used.
 """
+import collections
 import asyncio
 import json
 import logging
@@ -61,14 +66,15 @@ COST = float(os.getenv("COST_EACH_WAY", "0.02"))   # pump.fun fee ~1.2% + price 
 TIP_USD = float(os.getenv("TIP_USD", "1.0"))       # priority fee / Jito tip per transaction
 EXEC_DELAY_S = 2         # our buy would land ~2 s after we see the callout
 MAX_CALLOUT_AGE_S = 60   # older than this when first seen (e.g. after a restart): not bought
-MIN_GAP_S = float(os.getenv("PUMP_MIN_GAP_S", "7"))   # one pump.fun request per this many seconds
-FEED_MAX_GAP_S = 14      # the site-wide feed is polled at least this often
+MAX_PER_MIN = 7          # pump.fun requests in any 60 s: 1 per 7 s ran for hours without a 429...
+MIN_GAP_S = float(os.getenv("PUMP_MIN_GAP_S", "3"))   # ...and these apart (1.1 s apart was blocked in 11 s)
+FEED_EVERY_S = 20        # the site-wide feed is polled at least this often
 SPEND_SOL = 0.05         # a wallet dropping more than this bought something; fees are far smaller,
                          # and all 32 buys before a callout in the study were 0.084 SOL or more
-MINT_WATCH_MIN = 60      # a pushed callout on a coin a caller bought this recently can be theirs...
-SIZE_BAND = (0.7, 1.4)   # ...if the caller's position in the row is this many times what we saw them
-                         # spend. Strangers calling the same coins held $1-$357 against schoen's $240-$6,630;
-                         # site-wide, the median callout position is $37 and 2.6% are $500+ (2026-10-06)
+MINT_WATCH_MIN = 60      # a pushed callout on a coin a caller bought this recently may be theirs...
+SIZE_BAND = (0.5, 2.0)   # ...if the row's position is this many times what they spent: worth asking the
+                         # feed. Most strangers hold far less (median callout position $37), but copy-
+                         # traders hold the same: 14 strangers on schoen's coins were 0.70-1.23x (2026-10-06)
 LIMIT_MIN = 60           # anything still held after this is sold at the market
 
 RULES = {  # name: ([(fraction to sell, at this multiple of our fill)], stop multiple)
@@ -82,25 +88,34 @@ log = logging.getLogger("callout-bot")
 MINTS = {}                 # coin -> (caller, unix ms the watch ends, SOL they spent on it)
 DETECTED = queue.Queue()   # (caller, callout, arrival ms) from the push thread to the main loop
 PRICE = {}                 # "sol": USD, from pump.fun, refreshed every 10 min by the main loop
+PENDING = {}               # main loop only: callout id -> (give-up ms, size ratio) awaiting the feed
 
 
 class Api:
-    """Paced pump.fun GETs. A 429 pauses every request, doubling up to 5 minutes."""
+    """Rate-limited pump.fun GETs: at most MAX_PER_MIN in any 60 s, MIN_GAP_S apart.
+    A 429 pauses every request, doubling up to 5 minutes."""
 
     def __init__(self, session=None, clock=time.time, sleep=time.sleep):
         self.s = session or requests.Session()
         self.clock, self.sleep = clock, sleep
-        self.last, self.blocked_until, self.backoff = 0.0, 0.0, 0.0
+        self.sent, self.blocked_until, self.backoff = collections.deque(), 0.0, 0.0
+
+    def ready_at(self):
+        now = self.clock()
+        while self.sent and self.sent[0] <= now - 60:
+            self.sent.popleft()
+        return max(self.blocked_until, self.sent[-1] + MIN_GAP_S if self.sent else 0,
+                   self.sent[0] + 60 if len(self.sent) >= MAX_PER_MIN else 0)
 
     def wait(self):
         """Sleep until pump.fun may be asked again."""
-        left = max(self.last + MIN_GAP_S, self.blocked_until) - self.clock()
+        left = self.ready_at() - self.clock()
         if left > 0:
             self.sleep(left)
 
     def get(self, path, params):
         self.wait()
-        self.last = self.clock()
+        self.sent.append(self.clock())
         try:
             r = self.s.get(API + path, params=params, timeout=15,
                            headers={"User-Agent": "Mozilla/5.0", "Origin": "https://pump.fun"})
@@ -178,9 +193,10 @@ def remember(state, callout_id, created_ms):
 
 
 def poll_feed(api, state):
-    """New callouts by our callers from pump.fun's site-wide "New" feed, which lists
-    every position-backed callout with its caller, newest first. It also settles who
-    made each callout a position was opened on from the push."""
+    """(caller, callout, via, seen ms) for new callouts by our callers in pump.fun's
+    site-wide "New" feed, which lists every position-backed callout with its caller,
+    newest first. via is "push" when the push alarm asked for this poll. It also
+    settles every pending push alarm: found (ours or a stranger's), or given up."""
     d = api.get("/home-feed/new", {"pageSize": 50, "chain": "solana"})
     now_ms = api.now_ms()
     state["feed_ms"] = now_ms
@@ -191,14 +207,7 @@ def poll_feed(api, state):
         cid, caller = c.get("calloutId"), BY_PROFILE.get(pos.get("userId"))
         if not cid or not c.get("calloutTimestamp"):
             continue
-        p = state["positions"].get(cid)
-        if p is not None and p.get("author_ok") is None:
-            p["author_ok"] = caller == p["caller"]
-            if not p["author_ok"]:
-                log.warning("the pushed callout on %s was by %s, not %s; trade kept, marked wrong",
-                            p["mint"], pos.get("userName") or "someone else", p["caller"])
-                if p.get("watch"):              # their own callout on it may still come
-                    MINTS[p["mint"]] = tuple(p["watch"])
+        alarm = PENDING.pop(cid, None)
         if caller is None or cid in state["seen"]:
             continue
         created = int(datetime.fromisoformat(c["calloutTimestamp"].replace("Z", "+00:00")).timestamp() * 1000)
@@ -208,27 +217,30 @@ def poll_feed(api, state):
             log.info("%s callout %s is %.0fs old; not buying", caller, row["coinMint"], age)
             continue
         out.append((caller, {"calloutId": cid, "coinMint": row["coinMint"], "createdAt": created,
-                             "marketCap": c.get("calledOutAtMcap")}, now_ms))
+                             "marketCap": c.get("calledOutAtMcap"), "size_ratio": alarm and alarm[1]},
+                    "push" if alarm else "feed", now_ms))
+    for cid, (give_up, _) in list(PENDING.items()):
+        if give_up < now_ms:
+            del PENDING[cid]
     return out
 
 
-def take_pushed(state):
-    """Callouts the push thread matched to our callers since the last look."""
-    out = []
+def take_pushed(state, now_ms):
+    """Register the push alarms that came in since the last look; True if any did."""
+    got = False
     while True:
         try:
-            caller, c, seen_ms = DETECTED.get_nowait()
+            _, c, _ = DETECTED.get_nowait()
         except queue.Empty:
-            return out
+            return got
         if c["calloutId"] not in state["seen"]:
-            remember(state, c["calloutId"], c["createdAt"])
-            out.append((caller, c, seen_ms))
+            PENDING[c["calloutId"]] = (now_ms + 15_000, c.get("size_ratio"))
+            got = True
 
 
 def new_position(caller, c, seen_ms, via):
     return {"id": c["calloutId"], "caller": caller, "mint": c["coinMint"], "callout_ms": c["createdAt"],
-            "seen_ms": seen_ms, "via": via, "author_ok": True if via == "feed" else None,
-            "watch": c.get("watch"), "size_ratio": c.get("size_ratio"),
+            "seen_ms": seen_ms, "via": via, "author_ok": True, "size_ratio": c.get("size_ratio"),
             "mcap": c.get("marketCap"), "entry": None, "tokens": None,
             "last_bar_ms": None, "last_close": None, "checked_ms": 0,
             "rules": {name: {"left": 1.0, "hit": [False] * len(legs), "proceeds": 0.0, "sells": 0, "done": False}
@@ -336,33 +348,35 @@ def update(api, state, pos, now_ms):
 
 # ---- what to spend the next request on --------------------------------------------
 
-def pick(state, now_ms):
-    """The most useful next pump.fun request, in this order:
-    1. the site-wide feed, if not polled for FEED_MAX_GAP_S: it finds callouts and
-       confirms push matches, so positions never starve it
-    2. a position about to lose data: a busy coin's last 300 one-second bars
+def pick(state, now_ms, pending):
+    """The most useful next pump.fun request, or (None, None) to stay idle and keep
+    the rate budget free for the next push alarm. In this order:
+    1. the feed, at once, when a push alarm is waiting (again until the
+       callout shows up there, MIN_GAP_S apart)
+    2. the feed, if not polled for FEED_EVERY_S
+    3. a position about to lose data: a busy coin's last 300 one-second bars
        cover only ~5 minutes, and a paper buy must be priced within 4 minutes
-    3. the SOL price, if 10 minutes old (push matching needs it)
-    4. a paper buy waiting for its price
-    5. a position not checked for a minute
-    6. otherwise, the feed again"""
+    4. the SOL price, if 10 minutes old (the push alarm's size check needs it)
+    5. a paper buy waiting for its price
+    6. a position not checked for 2 minutes"""
+    since_feed = now_ms - state.get("feed_ms", 0)
+    if (pending and since_feed >= MIN_GAP_S * 1000) or since_feed >= FEED_EVERY_S * 1000:
+        return "feed", None
     held = [p for p in state["positions"].values() if p["entry"] is not None]
     waiting = [p for p in state["positions"].values() if p["entry"] is None
                and now_ms >= p["seen_ms"] + (EXEC_DELAY_S + 5) * 1000 and now_ms - p["checked_ms"] >= 10_000]
     urgent = ([p for p in held if now_ms - p["checked_ms"] >= 240_000]
               + [p for p in waiting if now_ms - p["seen_ms"] >= 120_000])
-    if now_ms - state.get("feed_ms", 0) >= FEED_MAX_GAP_S * 1000:
-        return "feed", None
     if urgent:
         return "position", min(urgent, key=lambda p: p["checked_ms"])
     if now_ms - state.get("sol_ms", 0) >= 600_000:
         return "sol", None
     if waiting:
         return "position", waiting[0]
-    stale = [p for p in held if now_ms - p["checked_ms"] >= 60_000]
+    stale = [p for p in held if now_ms - p["checked_ms"] >= 120_000]
     if stale:
         return "position", min(stale, key=lambda p: p["checked_ms"])
-    return "feed", None
+    return None, None
 
 
 def open_position(state, caller, c, seen_ms, via):
@@ -374,12 +388,11 @@ def open_position(state, caller, c, seen_ms, via):
 
 def step(api, state):
     """Wait for pump.fun's next free slot, then spend it on the most useful request.
-    Pushed callouts keep the time they arrived, so the wait does not delay the paper buy."""
+    False when there was nothing to ask."""
     api.wait()
-    for caller, c, seen_ms in take_pushed(state):
-        open_position(state, caller, c, seen_ms, "push")
     now_ms = api.now_ms()
-    kind, pos = pick(state, now_ms)
+    take_pushed(state, now_ms)
+    kind, pos = pick(state, now_ms, PENDING)
     if kind == "position":
         update(api, state, pos, now_ms)
     elif kind == "sol":
@@ -387,9 +400,10 @@ def step(api, state):
         price = (api.get("/sol-price", {}) or {}).get("solPrice")
         if price:
             PRICE["sol"] = float(price)
-    else:
-        for caller, c, seen_ms in poll_feed(api, state):
-            open_position(state, caller, c, seen_ms, "feed")
+    elif kind == "feed":
+        for caller, c, via, seen_ms in poll_feed(api, state):
+            open_position(state, caller, c, seen_ms, via)
+    return kind is not None
 
 
 # ---- the push: pump.fun's live "New" callouts feed (NATS over websocket) ------------
@@ -425,12 +439,10 @@ def nats_parse(buf):
 
 
 def push_match(row, mints, now_ms, sol_usd):
-    """(caller, callout) when a pushed callout is the caller's own, else None. A row
-    names the coin, not the caller, and strangers call the same coins all the time:
-    it counts only if the coin is one the caller bought within MINT_WATCH_MIN and the
-    row's position is the size of what they spent. pump.fun allows one callout per
-    user per coin, so a match ends the watch (poll_feed restores it if the match
-    proves wrong). The token starts with the creation time in microseconds."""
+    """(caller, callout) when a pushed callout may be one of our callers', else None:
+    the coin is one they bought within MINT_WATCH_MIN and the row's position is about
+    the size of what they spent. Only an alarm: a row names the coin, not the caller,
+    so the feed has to confirm it. The token starts with the creation time in µs."""
     hit = mints.get(row.get("coinMint"))
     if not hit or hit[1] < now_ms or not sol_usd:
         return None
@@ -440,9 +452,8 @@ def push_match(row, mints, now_ms, sol_usd):
     ratio = (row.get("costBasisUsd") or 0) / (hit[2] * sol_usd)
     if not SIZE_BAND[0] <= ratio <= SIZE_BAND[1]:
         return None
-    del mints[row["coinMint"]]
     return hit[0], {"calloutId": row["calloutId"], "coinMint": row["coinMint"], "createdAt": created,
-                    "marketCap": row.get("calledOutAtMcap"), "watch": list(hit), "size_ratio": round(ratio, 3)}
+                    "marketCap": row.get("calledOutAtMcap"), "size_ratio": round(ratio, 3)}
 
 
 async def push_watch(mints):
@@ -611,30 +622,30 @@ def run():
     else:
         log.warning("no SOLANA_WSS_URL/SOLANA_RPC_URL in .env: push matching OFF, callouts seen in 7-14 s")
     api, state, beat = Api(), load(), 0.0
-    # Unconfirmed push positions from before the size check (no size_ratio) were mostly strangers'
-    # callouts, and ones older than the feed's window can never be confirmed. Wrong matches that
-    # passed the size check stay: a live bot would have bought them too.
-    now = time.time() * 1000
-    drop = [k for k, p in state["positions"].items() if p.get("via") == "push" and p.get("author_ok") is not True
-            and (p.get("size_ratio") is None or (p.get("author_ok") is None and now - p["callout_ms"] > 300_000))]
+    # Earlier versions opened positions on unconfirmed push matches, mostly strangers' callouts.
+    # Now a position opens only once the feed confirms the caller, so those are not this strategy.
+    drop = [k for k, p in state["positions"].items() if p.get("via") == "push" and p.get("author_ok") is not True]
     for k in drop:
         del state["positions"][k]
     if drop:
-        log.info("dropped %d open paper positions: unchecked matches from before the size check, or callers "
-                 "the feed can no longer confirm", len(drop))
+        log.info("dropped %d open paper positions opened on unconfirmed push matches", len(drop))
     try:
         while True:
             try:
-                step(api, state)
+                busy = step(api, state)
             except Exception:   # logged with its traceback; paper positions stay saved
                 log.exception("step failed; retrying in 5s")
+                busy = False
                 time.sleep(5)
-            save(state)
+            if busy:
+                save(state)
+            else:
+                time.sleep(0.2)   # idle keeps the rate budget free; push alarms are picked up within 0.2 s
             if time.time() - beat >= 900:   # a heartbeat, so a quiet log still shows the bot is alive
                 beat = time.time()
                 watched = [f"{c}:{m[:6]}" for m, (c, t, _) in dict(MINTS).items() if t > beat * 1000]
-                log.info("alive: %d open paper positions; push-matching coins: %s", len(state["positions"]),
-                         ", ".join(watched) or "none yet")
+                log.info("alive: %d open paper positions; coins watched for a push alarm: %s",
+                         len(state["positions"]), ", ".join(watched) or "none yet")
     except KeyboardInterrupt:
         save(state)
         log.info("stopped; %d open paper positions saved", len(state["positions"]))
