@@ -426,6 +426,48 @@ class WalletWatch(unittest.TestCase):
         self.assertIsNone(bot.spend(note(1, sub=8), subs, last))              # not a caller's wallet
         self.assertIsNone(bot.spend({"jsonrpc": "2.0", "result": 7, "id": 1}, subs, last))   # a reply
 
+    def test_the_first_change_after_a_start_is_measured_from_the_starting_balance(self):
+        sub = {c: 100 + i for i, c in enumerate(bot.CALLERS, 1)}
+        frames = [json.dumps({"jsonrpc": "2.0", "id": i, "result": s}) for i, s in enumerate(sub.values(), 1)]
+        frames.append(json.dumps({"method": "accountNotification", "params": {"subscription": sub["schoen"], "result": {
+            "context": {"slot": 9}, "value": {"lamports": 8 * 10**9}}}}))      # the first change: 10 -> 8 SOL
+        named = []
+
+        class Socket:
+            def __init__(self):
+                self.frames = list(frames)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def send(self, data):
+                pass
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self.frames:
+                    await asyncio.sleep(10)                  # nothing more comes; the test stops it first
+                return self.frames.pop(0)
+
+        async def name_coins(rpc_url, caller, sol, slot, mints):
+            named.append((caller, round(sol, 3), slot))
+
+        async def run_briefly():
+            try:
+                await asyncio.wait_for(bot.watch("wss://x", "https://rpc", {}), 0.5)
+            except asyncio.TimeoutError:
+                pass
+        with mock.patch.dict(sys.modules, {"websockets": SimpleNamespace(connect=lambda *a, **k: Socket())}), \
+                mock.patch.object(bot, "balances", return_value={c: 10 * 10**9 for c in bot.CALLERS}), \
+                mock.patch.object(bot, "name_coins", name_coins):
+            asyncio.run(run_briefly())
+        self.assertEqual(named, [("schoen", 2.0, 9)])
+
     def test_only_coins_the_wallet_itself_received_count(self):
         def tx(signer, post):
             return {"transaction": {"message": {"accountKeys": [{"pubkey": WALLET, "signer": signer}]}},
@@ -472,6 +514,14 @@ class WalletTrack(unittest.TestCase):
         self.assertEqual(p["entry"], 1.2)
         self.assertAlmostEqual(p["rules"]["main: 50% at +30%, rest trails 30%, stop to 1.05x"]["left"], 0.5)
         self.assertAlmostEqual(p["rules"]["all at 2x"]["left"], 1.0)
+
+    def test_the_wallet_track_stops_taking_buys_when_full(self):
+        state = {"seen": {}, "positions": {"c": position()}}                  # a callout position does not count
+        for i in range(bot.WALLET_MAX_OPEN + 1):
+            bot.BOUGHT.put(("schoen", f"Coin{i}", 1.0, 0, 1))
+        bot.take_bought(state)
+        self.assertEqual(sum(p["via"] == "wallet" for p in state["positions"].values()), bot.WALLET_MAX_OPEN)
+        self.assertEqual(state["wallet_full"], 1)
 
     def test_the_wallet_track_comes_last_and_keeps_room_for_push_alarms(self):
         now = 10_000_000

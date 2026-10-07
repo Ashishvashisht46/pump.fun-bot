@@ -1,6 +1,6 @@
 """Pump.fun callout copier -- PAPER ONLY.
 
-Watches five callers' callouts on pump.fun. When one posts a new callout it
+Watches our callers' callouts on pump.fun (CALLERS). When one posts a new callout it
 records a paper buy at the real price a moment later, then sells by our own
 rules. It holds no key and contains no code that can send a transaction.
 
@@ -81,6 +81,21 @@ CALLERS = {  # name: (pump.fun profile id, Solana wallet)
     "schoen": ("cd23adcb-133e-4614-9493-535dc5c3c85a", "5hAgYC8TJCcEZV7LTXAzkTrm7YL29YXyQQJPCNrG84zM"),
     "pxblocito": ("fb7b35f3-7815-4e7b-8985-a7d96cc403d7", "7Mwof5tBvNPC6e1zwtHRQynqXcuDpqqbeY9vSZLW2Bv8"),
     "SoloFNF": ("d18fbf14-83bd-4331-acfe-920c81096899", "GccvEcZqMrcNdp3CarCasGdN5dUfdQ4wZ6iQsk5myRzX"),
+    # added 2026-10-07 from Ashish's invite links (join.pump.fun -> pump.fun/profile/<id>; wallet from the page,
+    # checked against the profile's own callout list)
+    "spuno": ("161a6705-a007-4151-811f-c21a71733360", "GfXQesPe3Zuwg8JhAt6Cg8euJDTVx751enp9EQQmhzPH"),
+    "untaxxable": ("c262a0de-4e69-4c2b-be93-85b9eef4231e", "2T5NgDDidkvhJQg8AHDi74uCFwgp25pYFMRZXBaCUNBH"),
+    "KayThedoc": ("fd1bf406-c7b4-4d7f-910a-54537f4813ad", "DYAn4XpAkN5mhiXkRB7dGq4Jadnx6XYgu8L5b3WGhbrt"),
+    "mitch": ("b8f1ac45-55b5-4704-919a-fb7105e59dc5", "4Be9CvxqHW6BYiRAxW9Q3xu1ycTMWaL5z8NX4HR3ha7t"),
+    "FlippingProfits": ("76129303-d90d-45f9-ae69-8c749505f90d", "DdM1tyCdoEyoxYYmGMjdf5rRPcpmj3UzZTpE7ScuTf7d"),
+    "sapphy": ("f345034e-684f-47b5-ab1f-7ba6c81464d3", "B5TrL7PsRUwCTL5bVcueieht5QchTw4TWLQDKqEaxEzi"),
+    "hexiecs": ("046999d1-1609-4654-b8ed-06827aa50ae9", "21rgbFW6sujQovCw3qt6R2EdE97Yzzvk8sSc37Bb72Cm"),
+    "0xEthan": ("36bd4b6f-f409-4be8-a062-5058f5b23bfb", "6yVb4pxNwDfr6rovwNnBg3SyKSvDcHGD4WdFPN1JJBqm"),
+    "croakie": ("09d6f634-beb7-436e-9e41-7b9061f9673f", "7fEXteaTtmX1uR8fpChEXsevM4icH5vq8LNL9dzDupX2"),
+    "J777Crypto": ("1e2df2f0-4720-4edb-a6d2-dd2833300de9", "4UrFSCrGxgoCtCUBAEZq7ZmPK3Pczkxx7PwYnkBMi1KR"),
+    "cooker": ("88126e6e-497b-4cf8-8bcc-fdacf422431f", "8deJ9xeUvXSJwicYptA9mHsU2rN2pDx37KWzkDkEXhU6"),
+    "_logjam": ("bf9041db-31a9-4d3c-9bfa-7b9e0cde1512", "AH39BneW9UeWxQysUcwogQrYFdPvJuRVZ5w4ccq9SKfL"),
+    "jackduvalcalls": ("cef4bed6-680b-491c-8089-1f3c6bfe763b", "BAr5csYtpWoNpwhUjixX7ZPHXkUciFZzjBp9uNxZXJPh"),
 }
 BY_PROFILE = {profile: name for name, (profile, _) in CALLERS.items()}
 
@@ -106,6 +121,9 @@ WALLET_FIRST_S = 240     # wallet track: a buy is priced once this much of its b
                          # them second by second; the rest of its hour is scored when the hour is up, from minute
                          # bars on a busy coin (coarser: a minute touching the stop and a target counts as the stop)
 WALLET_ROOM = 3          # ...and only while it leaves this many of the minute's requests free for a push alarm
+WALLET_MAX_OPEN = 20     # that leaves it ~1 request a minute, and a position takes 2-4 over its hour: buys beyond
+                         # this many open are counted, not tracked (with 18 wallets the backlog would only grow,
+                         # and minute bars reach back 300 min at most)
 
 RULES = {  # name: ([(fraction to sell, at this multiple of our fill)], stop multiple,
            #        stop multiple once a target has sold, trailing stop on the rest once a target has sold)
@@ -513,12 +531,17 @@ def take_bought(state):
         except queue.Empty:
             return
         key = f"wallet:{caller}:{coin}"
-        if key not in state["positions"]:
-            state["positions"][key] = dict(new_position(caller, {"calloutId": key, "coinMint": coin,
-                                                                 "createdAt": spent_ms}, named_ms, "wallet"),
-                                           sol=round(sol, 4))
-            log.info("WALLET TRACK: %s bought %s; paper buy 2 s after we named it, priced in %d min", caller, coin,
-                     WALLET_FIRST_S // 60)
+        if key in state["positions"]:
+            continue
+        if sum(p.get("via") == "wallet" for p in state["positions"].values()) >= WALLET_MAX_OPEN:
+            state["wallet_full"] = state.get("wallet_full", 0) + 1
+            log.info("WALLET TRACK full (%d open): %s's buy of %s not tracked", WALLET_MAX_OPEN, caller, coin)
+            continue
+        state["positions"][key] = dict(new_position(caller, {"calloutId": key, "coinMint": coin,
+                                                             "createdAt": spent_ms}, named_ms, "wallet"),
+                                       sol=round(sol, 4))
+        log.info("WALLET TRACK: %s bought %s; paper buy 2 s after we named it, priced in %d min", caller, coin,
+                 WALLET_FIRST_S // 60)
 
 
 def step(api, state):
@@ -720,17 +743,33 @@ async def name_coins(rpc_url, caller, sol, slot, mints):
              caller, sol, ", ".join(sorted(coins)) or "no coin found", MINT_WATCH_MIN)
 
 
+def balances(rpc_url, callers):
+    """Each caller's SOL balance now, in lamports: one getMultipleAccounts call."""
+    value = requests.post(rpc_url, timeout=10, json={
+        "jsonrpc": "2.0", "id": 1, "method": "getMultipleAccounts",
+        "params": [[CALLERS[c][1] for c in callers], {"encoding": "base64", "commitment": "confirmed"}]}
+    ).json()["result"]["value"]
+    return {c: (v or {}).get("lamports", 0) for c, v in zip(callers, value)}
+
+
 async def watch(wss_url, rpc_url, mints):
     """Watch the callers' wallet balances. Their transaction logs were tried first:
     other people's failed transactions mention schoen's wallet ~18 times a second
     (~1 GB a day), and Helius bills websocket data at 2 credits per 0.1 MB."""
     import websockets
-    # Balances survive reconnects. ponytail: a caller's first balance change after the bot
-    # starts only sets their baseline; seed `last` with getMultipleAccounts if that matters.
+    # Balances survive reconnects, so a drop during one still shows. They are read before the
+    # first subscription: otherwise a caller's first change after a start only set the baseline,
+    # and a buy then was missed by the wallet track and the push alarm alike.
     last, delay, tasks = {}, 1, set()
     while True:
         try:
             async with websockets.connect(wss_url, open_timeout=15, ping_interval=20) as ws:
+                if missing := [c for c in CALLERS if c not in last]:
+                    try:
+                        last.update(await asyncio.to_thread(balances, rpc_url, missing))
+                    except Exception as exc:   # type only: the error can hold the RPC URL and its key
+                        log.warning("wallet watch: starting balances unread (%s); first changes only set them",
+                                    type(exc).__name__)
                 by_id, by_sub = {}, {}
                 for i, (caller, (_, wallet)) in enumerate(CALLERS.items(), 1):
                     by_id[i] = caller
@@ -896,7 +935,8 @@ def by_rule(label, group):
 
 
 def report():
-    trades, held = read_trades(), list(load()["positions"].values())
+    trades, state = read_trades(), load()
+    held = list(state["positions"].values())
     print(f"{len(trades)} closed paper trades, {sum(p.get('via') != 'wallet' for p in held)} open, "
           f"${STAKE_USD:.0f} each")
     wrong = sum(t.get("author_ok") is False for t in trades)
@@ -920,7 +960,8 @@ def report():
                   f"  (n={len(lag)})")
     wallet = read_trades("wallet_trades.jsonl")
     print(f"\n\nWALLET TRACK (a paper buy of every coin a caller buys, 2 s after the bot names it): "
-          f"{len(wallet)} closed, {sum(p.get('via') == 'wallet' for p in held)} open")
+          f"{len(wallet)} closed, {sum(p.get('via') == 'wallet' for p in held)} open, "
+          f"{state.get('wallet_full', 0)} buys not tracked because {WALLET_MAX_OPEN} were open")
     by_rule("all", wallet)
     by_rule("coins they called while we held them", [t for t in wallet if t.get("called_ms")])
     by_rule("coins not called while we held them", [t for t in wallet if not t.get("called_ms")])
