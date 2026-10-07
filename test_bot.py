@@ -56,6 +56,9 @@ class FakeApi:
     def wait(self):
         pass
 
+    def room(self):
+        return bot.MAX_PER_MIN
+
     def now_ms(self):
         return self.t
 
@@ -139,9 +142,31 @@ class ExitRules(unittest.TestCase):
         state = {"seen": {}, "positions": {"c1": p}}
         busy = [bar(400 + i, 1.1, 1.1, 1.1, 1.1) for i in range(300)]          # the last 300 seconds all traded
         minutes = [(m * 60_000, 60_000, 1.0, 1.0, 0.6 if m == 0 else 1.0, 1.0, True) for m in range(12)]
-        bot.update(FakeApi(candles=busy + minutes), state, p, 720_000)
-        # the stop broke in minute 0, partly seen and before those 300 seconds: it must not be skipped
+        bot.update(FakeApi(candles=[bar(45, 1.0, 1.0, 0.6, 0.6)] + busy + minutes), state, p, 720_000)
+        # the stop broke at second 45, after the last look and before those 300 seconds: it must not be skipped
         self.assertAlmostEqual(p["rules"]["all at 2x"]["proceeds"], TOKENS * 0.7 * (1 - bot.COST))
+
+    def test_a_partly_seen_minute_is_finished_in_seconds_not_replayed(self):
+        p = position(checked_ms=0)
+        bot.apply_bar(p, bar(10, 1.0, 1.0, 1.0, 1.0))
+        bot.apply_bar(p, bar(50, 1.0, 1.35, 1.0, 1.3))                        # half sold at 1.3x; stop now 1.05x
+        p["last_bar_ms"] = 50_000
+        state = {"seen": {}, "positions": {"c1": p}}
+        busy = [bar(400 + i, 1.3, 1.3, 1.3, 1.3) for i in range(300)]
+        minutes = [(m * 60_000, 60_000, 1.0 if m == 0 else 1.3, 1.35, 1.0 if m == 0 else 1.25, 1.3, True)
+                   for m in range(12)]
+        bot.update(FakeApi(candles=[bar(55, 1.3, 1.3, 1.29, 1.3)] + busy + minutes), state, p, 720_000)
+        # minute 0's bar opens at 1.0 and dips to 1.0, but both were before the stop was raised
+        self.assertAlmostEqual(p["rules"]["main: 50% at +30%, rest trails 30%, stop to 1.05x"]["left"], 0.5)
+        self.assertEqual(p["last_bar_ms"], 659_000)     # through minute 10's last second (minute 11 is too new)
+
+    def test_no_answer_is_not_taken_for_no_trades(self):
+        p = position(checked_ms=0)
+        state = {"seen": {}, "positions": {"c1": p}}
+        api = FakeApi()
+        api.get = lambda path, params: None                                    # rate limited, or the network
+        bot.update(api, state, p, (bot.LIMIT_MIN + 2) * 60_000)
+        self.assertIn("c1", state["positions"])                               # not sold at an hour-old price
 
     def test_buy_pays_the_highest_price_between_seeing_and_landing(self):
         bs = [bar(9, 1.0, 1.1, 0.9, 1.0), bar(10, 1.0, 1.3, 1.0, 1.2), bar(11, 1.2, 1.25, 1.1, 1.2),
@@ -343,6 +368,9 @@ class Pacing(unittest.TestCase):
         for _ in range(9):
             api.get("/x", {})
         self.assertEqual(times, [0, 3, 6, 9, 12, 15, 18, 60, 63])   # the 8th waits for the 1st to age out
+        self.assertEqual(api.room(), 0)                              # 6..63: the minute is full
+        clock.t = 70.0
+        self.assertEqual(api.room(), 2)                              # 6 and 9 have aged out
 
 
 class Scheduler(unittest.TestCase):
@@ -407,6 +435,89 @@ class WalletWatch(unittest.TestCase):
         self.assertEqual(bot.received(tx(True, [("Held", "5"), ("CoinA", "9"), (bot.WSOL, "7")]), WALLET), {"CoinA"})
         self.assertEqual(bot.received(tx(True, [("Held", "9")]), WALLET), {"Held"})    # more of one it held
         self.assertEqual(bot.received(tx(False, [("CoinA", "9")]), WALLET), set())     # someone else's transaction
+
+
+class WalletTrack(unittest.TestCase):
+    T = 2_000_000_000
+
+    def setUp(self):
+        while not bot.BOUGHT.empty():
+            bot.BOUGHT.get_nowait()
+
+    def test_a_named_buy_goes_to_the_wallet_track(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(bot, "bought_coins", return_value={"CoinA", "CoinB"}):
+            bot.STATE_DIR = d
+            asyncio.run(bot.name_coins("rpc", "schoen", 4.0, 77, {}))
+        self.assertEqual(sorted(bot.BOUGHT.get_nowait()[:3] for _ in range(2)),
+                         [("schoen", "CoinA", 2.0), ("schoen", "CoinB", 2.0)])   # one slot, two coins: SOL split
+
+    def test_a_wallet_buy_is_priced_once_its_first_4_minutes_are_in_with_one_request(self):
+        t = self.T
+        bot.BOUGHT.put(("schoen", "CoinW", 10.0, t - 2_100, t))                 # balance drop, coin named 2.1 s later
+        bot.BOUGHT.put(("schoen", "CoinW", 3.0, t + 4_000, t + 6_000))          # more of it: still one position
+        state = {"seen": {}, "positions": {}}
+        bot.take_bought(state)
+        p = state["positions"]["wallet:schoen:CoinW"]
+        self.assertEqual((len(state["positions"]), p["via"], p["sol"], p["entry"]), (1, "wallet", 10.0, None))
+        first = t + (bot.EXEC_DELAY_S + bot.WALLET_FIRST_S) * 1000 + 6_000
+        state.update(feed_ms=first, sol_ms=first)
+        self.assertEqual(bot.pick(state, first - 1, {}), (None, None))         # a callout buy would be priced by now
+        self.assertEqual(bot.pick(state, first, {}), ("position", p))
+        api = FakeApi(candles=[bar(t // 1000 - 5, 1.0, 1.0, 1.0, 1.0),
+                               bar(t // 1000 + 1, 1.1, 1.2, 1.1, 1.15),         # between naming and landing: pays 1.2
+                               bar(t // 1000 + 100, 1.5, 1.6, 1.5, 1.6),       # +33%: the main rule sells half
+                               bar(t // 1000 + 400, 9.0, 9.0, 9.0, 9.0)])       # after the 4 min: scored later
+        bot.update(api, state, p, first)
+        self.assertEqual([c[1]["to"] for c in api.calls], [t + 2_000 + 240_000])
+        self.assertEqual(p["entry"], 1.2)
+        self.assertAlmostEqual(p["rules"]["main: 50% at +30%, rest trails 30%, stop to 1.05x"]["left"], 0.5)
+        self.assertAlmostEqual(p["rules"]["all at 2x"]["left"], 1.0)
+
+    def test_the_wallet_track_comes_last_and_keeps_room_for_push_alarms(self):
+        now = 10_000_000
+        w = bot.new_position("schoen", {"calloutId": "wallet:schoen:W", "coinMint": "W", "createdAt": now - 302_000},
+                             now - 300_000, "wallet")                           # unpriced for 5 min, and due
+        state = {"seen": {}, "feed_ms": now, "sol_ms": now,
+                 "positions": {w["id"]: w, "c": dict(position(checked_ms=now - 130_000), id="c")}}
+        self.assertEqual(bot.pick(state, now, {})[1]["id"], "c")                # a callout's routine check first
+        del state["positions"]["c"]
+        self.assertEqual(bot.pick(state, now, {}, room=bot.WALLET_ROOM), (None, None))   # too little room left
+        self.assertEqual(bot.pick(state, now, {}, room=bot.WALLET_ROOM + 1), ("position", w))
+        w.update(entry=1.0, entry_ms=now - 60_000, checked_ms=now)               # priced: next, when its hour is up
+        state.update(feed_ms=now + 600_000, sol_ms=now + 600_000)
+        self.assertEqual(bot.pick(state, now + 600_000, {}), (None, None))
+        later = now - 60_000 + (bot.LIMIT_MIN + 1) * 60_000
+        state.update(feed_ms=later, sol_ms=later)
+        self.assertEqual(bot.pick(state, later - 1, {}), (None, None))
+        self.assertEqual(bot.pick(state, later, {}), ("position", w))
+
+    def test_wallet_trades_are_kept_apart_and_know_when_the_coin_was_called(self):
+        with tempfile.TemporaryDirectory() as d:
+            bot.STATE_DIR = d
+            bot.PENDING.clear()
+            t = self.T
+            bot.BOUGHT.put(("marcell", "CoinW", 4.0, t - 2_000, t))
+            api = FakeApi(now_ms=t + 30_000, feed=[feed_row("k1", PROFILE["marcell"], "CoinW", t + 29_000)],
+                          candles=[bar(t // 1000 + 1, 1.0, 1.0, 1.0, 1.0), bar(t // 1000 + 30, 1.3, 2.5, 1.3, 2.4)])
+            state = bot.load()
+            bot.step(api, state)                             # the buy opens a position; the feed shows the callout
+            w = state["positions"]["wallet:marcell:CoinW"]
+            self.assertEqual(w["called_ms"], t + 29_000)
+            self.assertIn("k1", state["positions"])          # the callout track buys it too, on its own
+            bot.update(api, state, w, t + 300_000)          # priced at 1.0
+            bot.update(api, state, w, t + 62 * 60_000)      # its hour is up: closed
+            [trade] = bot.read_trades("wallet_trades.jsonl")
+            self.assertEqual((trade["via"], trade["sol"], trade["called_ms"], trade["entry"]),
+                             ("wallet", 4.0, t + 29_000, 1.0))
+            self.assertEqual(bot.read_trades(), [])          # nothing in the callout track's file
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                bot.history(wallet=True)
+                bot.report()
+            self.assertIn("they called it 31s after buying", out.getvalue())
+            with open(os.path.join(d, "wallet_history.csv"), encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            for rule, result in trade["pnl"].items():
+                self.assertAlmostEqual(sum(float(r["net_usd"]) for r in rows if r["rule"] == rule), result, places=1)
 
 
 class History(unittest.TestCase):
