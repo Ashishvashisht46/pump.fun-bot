@@ -88,16 +88,16 @@ class ExitRules(unittest.TestCase):
         p = position()
         bot.apply_bar(p, bar(1, 1.0, 1.35, 1.0, 1.3))           # 50% sold at 1.3x; stop goes to 1.05x
         bot.apply_bar(p, bar(2, 1.3, 1.3, 1.04, 1.1))           # dips to 1.04: the raised stop sells the rest
-        safer = p["rules"]["safer: 50% at +30%, rest trails 30%, stop to 1.05x"]
+        safer = p["rules"]["main: 50% at +30%, rest trails 30%, stop to 1.05x"]
         self.assertEqual(safer["fills"], [[1000, 0.5, 1.3, "target 1.3x"], [2000, 0.5, 1.05, "stop 1.05x"]])
-        self.assertAlmostEqual(p["rules"]["main: 50% at +30%, 50% rides to 2x"]["left"], 0.5)   # main still rides
+        self.assertAlmostEqual(p["rules"]["50% at +30%, 50% rides to 2x"]["left"], 0.5)   # the 2x rule still rides
 
     def test_safer_rule_trails_30_percent_below_the_peak(self):
         p = position()
         bot.apply_bar(p, bar(1, 1.0, 1.35, 1.0, 1.3))
         bot.apply_bar(p, bar(2, 1.4, 2.0, 1.4, 1.9))            # peak 2.0: the trailing stop is now 1.4
         bot.apply_bar(p, bar(3, 1.9, 1.9, 1.39, 1.5))
-        safer = p["rules"]["safer: 50% at +30%, rest trails 30%, stop to 1.05x"]
+        safer = p["rules"]["main: 50% at +30%, rest trails 30%, stop to 1.05x"]
         self.assertEqual(safer["fills"][-1][1:3], [0.5, 1.4])
         self.assertTrue(safer["fills"][-1][3].startswith("trailing stop"))
 

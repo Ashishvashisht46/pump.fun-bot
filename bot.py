@@ -97,12 +97,14 @@ LIMIT_MIN = 60           # anything still held after this is sold at the market
 
 RULES = {  # name: ([(fraction to sell, at this multiple of our fill)], stop multiple,
            #        stop multiple once a target has sold, trailing stop on the rest once a target has sold)
-    # Per $100 trade on 47 past callouts, bought 3.4 s after posting (scratchpad optimize.py, 2026-10-06):
-    "main: 50% at +30%, 50% rides to 2x": ([(0.5, 1.3), (0.5, 2.0)], 0.7, None, None),               # +4.56
-    "safer: 50% at +30%, rest trails 30%, stop to 1.05x": ([(0.5, 1.3)], 0.7, 1.05, 0.3),           # +2.91
-    "old main: 80% at +20%, 20% rides to 2x": ([(0.8, 1.2), (0.2, 2.0)], 0.7, None, None),          # +0.66
-    "50% at +20%, 50% at 2x": ([(0.5, 1.2), (0.5, 2.0)], 0.7, None, None),                          # +3.33
-    "all at 2x": ([(1.0, 2.0)], 0.7, None, None),                                                   # +8.45
+    # Per $100 trade on 58 past callouts, bought 3.4 s after posting (scratchpad candidates.py, 2026-10-07):
+    # avg / win rate / max drawdown. All are near break-even; the main has the smallest drawdown and held
+    # up best on the newest half (-0.65 vs -4.7..-6.4 for the others), which includes a night of dumps.
+    "main: 50% at +30%, rest trails 30%, stop to 1.05x": ([(0.5, 1.3)], 0.7, 1.05, 0.3),       # +1.01 55% 199
+    "50% at +30%, 50% rides to 2x": ([(0.5, 1.3), (0.5, 2.0)], 0.7, None, None),               # +0.52 34% 272
+    "old main: 80% at +20%, 20% rides to 2x": ([(0.8, 1.2), (0.2, 2.0)], 0.7, None, None),     # -2.55 62% 314
+    "50% at +20%, 50% at 2x": ([(0.5, 1.2), (0.5, 2.0)], 0.7, None, None),                     # -0.79 36% 323
+    "all at 2x": ([(1.0, 2.0)], 0.7, None, None),                                              # +2.73 29% 343
 }
 RETIRED = {  # still applied to positions opened before they were dropped or renamed
     "main: 80% at +20%, 20% rides to 2x": RULES["old main: 80% at +20%, 20% rides to 2x"],
