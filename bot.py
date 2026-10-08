@@ -122,6 +122,8 @@ RULES = {  # name: ([(fraction to sell, at this multiple of our fill)], stop mul
     "old main: 80% at +20%, 20% rides to 2x": ([(0.8, 1.2), (0.2, 2.0)], 0.7, None, None),     # -2.55 62% 314
     "50% at +20%, 50% at 2x": ([(0.5, 1.2), (0.5, 2.0)], 0.7, None, None),                     # -0.79 36% 323
     "all at 2x": ([(1.0, 2.0)], 0.7, None, None),                                              # +2.73 29% 343
+    # Ashish's, added 2026-10-08 (same backtest: -3.53 45% 379; older half +0.59, newer -7.65)
+    "40% at +20%, 40% at +40%, 20% at 2x": ([(0.4, 1.2), (0.4, 1.4), (0.2, 2.0)], 0.7, None, None),
 }
 RETIRED = {  # still applied to positions opened before they were dropped or renamed
     "main: 80% at +20%, 20% rides to 2x": RULES["old main: 80% at +20%, 20% rides to 2x"],
