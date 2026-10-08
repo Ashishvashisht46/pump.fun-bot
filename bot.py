@@ -4,21 +4,15 @@ Watches our callers' callouts on pump.fun (CALLERS). When one posts a new callou
 records a paper buy at the real price a moment later, then sells by our own
 rules. It holds no key and contains no code that can send a transaction.
 
-    .venv\\Scripts\\python.exe bot.py                  run
-    .venv\\Scripts\\python.exe bot.py report           results so far, both tracks
-    .venv\\Scripts\\python.exe bot.py history          every trade: buy, sells, fees (also state/history.csv)
-    .venv\\Scripts\\python.exe bot.py history wallet   the same for the wallet track (state/wallet_history.csv)
+    .venv\\Scripts\\python.exe bot.py           run
+    .venv\\Scripts\\python.exe bot.py report    results so far
+    .venv\\Scripts\\python.exe bot.py history   every trade: buy, sells, fees (also state/history.csv)
 
 Why callouts and not the callers' wallet buys: 84% of their buys are never
 called; the callout is what moves the price (study in the Obsidian vault,
-robinhood-bot AD-050). The main rule needs the callout within ~5 s.
-
-WALLET TRACK, alongside and kept apart (its own trades file and report): every
-coin a caller is seen buying also gets a $100 paper buy, 2 s after the bot names
-the coin, ahead of the copy-trading bots that pump it before the callout. In the
-study copying their buys lost (-$3.69 a $50 trade over 88); this measures it again
-with today's rules. Its prices come from requests the callout track does not need:
-last in line, and only while WALLET_ROOM of the minute's requests stay free.
+robinhood-bot AD-050). The main rule needs the callout within ~5 s. A paper track
+that bought every coin they bought (2026-10-07/08, commits a022218-fc6ee95) lost
+-$1,808 over 148 trades and was removed; its trades stay in state/wallet_trades.jsonl.
 
 How it sees a callout within ~2 s:
 - PUSH: pump.fun's website gets every new callout pushed over its public NATS
@@ -117,13 +111,6 @@ EVM_ALARM_USD = 300      # no wallet watch on EVM chains, and ~5 EVM callouts a 
                          # to ask the feed about: only those with a position this big (top ~10% site-wide;
                          # marcell's Solana buys run in the thousands) get asked about at once
 LIMIT_MIN = 60           # anything still held after this is sold at the market
-WALLET_FIRST_S = 240     # wallet track: a buy is priced once this much of its bars is in, so one request covers
-                         # them second by second; the rest of its hour is scored when the hour is up, from minute
-                         # bars on a busy coin (coarser: a minute touching the stop and a target counts as the stop)
-WALLET_ROOM = 3          # ...and only while it leaves this many of the minute's requests free for a push alarm
-WALLET_MAX_OPEN = 20     # that leaves it ~1 request a minute, and a position takes 2-4 over its hour: buys beyond
-                         # this many open are counted, not tracked (with 18 wallets the backlog would only grow,
-                         # and minute bars reach back 300 min at most)
 
 RULES = {  # name: ([(fraction to sell, at this multiple of our fill)], stop multiple,
            #        stop multiple once a target has sold, trailing stop on the rest once a target has sold)
@@ -145,7 +132,6 @@ RENAMED = {"main: 80% at +20%, 20% rides to 2x": "old main: 80% at +20%, 20% rid
 log = logging.getLogger("callout-bot")
 MINTS = {}                 # coin -> (caller, unix ms the watch ends, SOL they spent on it)
 DETECTED = queue.Queue()   # (caller, callout, arrival ms) from the push thread to the main loop
-BOUGHT = queue.Queue()     # (caller, coin, SOL, balance-drop ms, named ms) from the wallet watch to the main loop
 PRICE = {}                 # "sol": USD, from pump.fun, refreshed every 10 min by the main loop
 PENDING = {}               # main loop only: callout id -> (give-up ms, size ratio) awaiting the feed
 
@@ -165,11 +151,6 @@ class Api:
             self.sent.popleft()
         return max(self.blocked_until, self.sent[-1] + MIN_GAP_S if self.sent else 0,
                    self.sent[0] + 60 if len(self.sent) >= MAX_PER_MIN else 0)
-
-    def room(self):
-        """Requests still allowed in the current 60 s."""
-        self.ready_at()   # drops the ones older than that
-        return MAX_PER_MIN - len(self.sent)
 
     def wait(self):
         """Sleep until pump.fun may be asked again."""
@@ -399,9 +380,11 @@ def update(api, state, pos, now_ms):
         if not any(b[0] > landed for b in bs):
             # Data that does not reach past our landing may miss the fill window. Never
             # guess: a 150 s fallback priced a Solana buy from bars older than the pump
-            # (2026-10-07: data minutes late, fill 0.61x the real one).
-            if now_ms - pos["seen_ms"] > 600_000:
-                log.warning("no price data past the buy for %s after 10 min; dropping it", pos["mint"])
+            # (2026-10-07: data minutes late, fill 0.61x the real one). Wait an hour: from
+            # ~22:00 to ~01:00 on 2026-10-07 every coin's data came over 10 min late (it all
+            # arrived later), and the 10 min this used to wait dropped 9 callouts caught in 1-6 s.
+            if now_ms - pos["seen_ms"] > 3_600_000:
+                log.warning("no price data past the buy for %s after 60 min; dropping it", pos["mint"])
                 del state["positions"][pos["id"]]
             return
         price = fill_price(bs, pos["seen_ms"], landed)
@@ -411,14 +394,9 @@ def update(api, state, pos, now_ms):
             return
         pos.update(entry=price, entry_ms=landed, tokens=STAKE_USD * (1 - COST) / price, last_close=price,
                    last_bar_ms=max([b[0] for b in bs if b[0] <= landed] or [landed - 1000]))
-        if pos.get("via") == "wallet":
-            log.info("WALLET TRACK PAPER BUY $%.0f of %s (%s bought it for %.2f SOL) at $%.3g; coin named %.1fs "
-                     "after their balance dropped", STAKE_USD, pos["mint"], pos["caller"], pos.get("sol") or 0, price,
-                     (pos["seen_ms"] - pos["callout_ms"]) / 1000)
-        else:
-            log.info("PAPER BUY $%.0f of %s (called by %s) at $%.3g; callout seen %.1fs after posting, via %s",
-                     STAKE_USD, pos["mint"], pos["caller"], price, (pos["seen_ms"] - pos["callout_ms"]) / 1000,
-                     pos.get("via", "list"))
+        log.info("PAPER BUY $%.0f of %s (called by %s) at $%.3g; callout seen %.1fs after posting, via %s",
+                 STAKE_USD, pos["mint"], pos["caller"], price, (pos["seen_ms"] - pos["callout_ms"]) / 1000,
+                 pos.get("via", "list"))
     elif raw is None:
         return   # no answer: nothing learned (and no sign the coin stopped trading); the next look resumes here
     elif len(raw) == 300 and raw[0][0] > pos["last_bar_ms"] + 1000:
@@ -452,30 +430,17 @@ def update(api, state, pos, now_ms):
                  "callout_ms": pos["callout_ms"], "seen_ms": pos["seen_ms"], "via": pos.get("via"),
                  "author_ok": pos.get("author_ok"), "size_ratio": pos.get("size_ratio"), "entry": pos["entry"],
                  "entry_ms": pos["entry_ms"], "tokens": pos["tokens"],
-                 **{k: pos[k] for k in ("sol", "called_ms") if k in pos},
                  "fills": {name: r.get("fills", []) for name, r in pos["rules"].items()},
                  "pnl": {name: round(pnl(r), 2) for name, r in pos["rules"].items()}}
-        wallet = pos.get("via") == "wallet"
-        record("wallet_trades.jsonl" if wallet else "trades.jsonl", trade)
+        record("trades.jsonl", trade)
         del state["positions"][pos["id"]]
-        log.info("%sCLOSED %s (%s): %s", "WALLET TRACK " if wallet else "", pos["mint"], pos["caller"],
+        log.info("CLOSED %s (%s): %s", pos["mint"], pos["caller"],
                  " | ".join(f"{k}: {v:+.2f}" for k, v in trade["pnl"].items()))
 
 
 # ---- what to spend the next request on --------------------------------------------
 
-def wallet_due(p):
-    """When a wallet-track position next needs a request: its buy once WALLET_FIRST_S of
-    bars are complete (one request then covers them second by second; then a try every
-    2 minutes), its exits once its hour is up (from minute bars where the seconds have
-    scrolled out). Exits are scored from the bars, so late changes nothing."""
-    if p["entry"] is None:
-        return max(p["seen_ms"] + (EXEC_DELAY_S + WALLET_FIRST_S) * 1000 + settle_ms(p.get("chain", SOL)) + 1000,
-                   p["checked_ms"] + 120_000)
-    return max(p["entry_ms"] + (LIMIT_MIN + 1) * 60_000, p["checked_ms"] + 60_000)
-
-
-def pick(state, now_ms, pending, room=MAX_PER_MIN):
+def pick(state, now_ms, pending):
     """The most useful next pump.fun request, or (None, None) to stay idle and keep
     the rate budget free for the next push alarm. In this order:
     1. the feed, at once, when a push alarm is waiting (again until the
@@ -484,18 +449,18 @@ def pick(state, now_ms, pending, room=MAX_PER_MIN):
     3. a position about to lose data: a busy coin's last 300 one-second bars
        cover only ~5 minutes, and a paper buy must be priced within 4 minutes
     4. the SOL price, if 10 minutes old (the push alarm's size check needs it)
-    5. a paper buy waiting for its price, once its chain's bars are complete
-    6. a position not checked for 2 minutes
-    7. the wallet track, when due (wallet_due), and only while `room`, the requests
-       still allowed this minute, keeps WALLET_ROOM free for a push alarm"""
+    5. a paper buy waiting for its price, once its chain's bars are complete (tried
+       every 10 s, after 2 minutes every 30 s, after 10 minutes every 2 minutes:
+       pump.fun's data has been hours late, and an outage must not eat the budget)
+    6. a position not checked for 2 minutes"""
     since_feed = now_ms - state.get("feed_ms", 0)
     if (pending and since_feed >= MIN_GAP_S * 1000) or since_feed >= FEED_EVERY_S * 1000:
         return "feed", None
-    ps = [p for p in state["positions"].values() if p.get("via") != "wallet"]
-    held = [p for p in ps if p["entry"] is not None]
-    waiting = [p for p in ps if p["entry"] is None
+    held = [p for p in state["positions"].values() if p["entry"] is not None]
+    waiting = [p for p in state["positions"].values() if p["entry"] is None
                and now_ms >= p["seen_ms"] + EXEC_DELAY_S * 1000 + settle_ms(p.get("chain", SOL)) + 1000
-               and now_ms - p["checked_ms"] >= (10_000 if now_ms - p["seen_ms"] < 120_000 else 30_000)]
+               and now_ms - p["checked_ms"] >= (10_000 if now_ms - p["seen_ms"] < 120_000 else
+                                                30_000 if now_ms - p["seen_ms"] < 600_000 else 120_000)]
     urgent = ([p for p in held if now_ms - p["checked_ms"] >= 240_000]
               + [p for p in waiting if now_ms - p["seen_ms"] >= 120_000])
     if urgent:
@@ -507,9 +472,6 @@ def pick(state, now_ms, pending, room=MAX_PER_MIN):
     stale = [p for p in held if now_ms - p["checked_ms"] >= 120_000]
     if stale:
         return "position", min(stale, key=lambda p: p["checked_ms"])
-    due = [p for p in state["positions"].values() if p.get("via") == "wallet" and wallet_due(p) <= now_ms]
-    if due and room > WALLET_ROOM:
-        return "position", min(due, key=wallet_due)
     return None, None
 
 
@@ -518,30 +480,6 @@ def open_position(state, caller, c, seen_ms, via):
     log.info("CALLOUT %s -> %s (mcap $%s) via %s, seen %.1fs after posting%s", caller, c["coinMint"],
              f"{c.get('marketCap') or 0:,.0f}", via, (seen_ms - c["createdAt"]) / 1000,
              f"; their position is {c['size_ratio']:.2f}x what they spent" if c.get("size_ratio") else "")
-    if (w := state["positions"].get(f"wallet:{caller}:{c['coinMint']}")) is not None:
-        w["called_ms"] = c["createdAt"]   # the wallet track's report splits called coins from the rest
-
-
-def take_bought(state):
-    """A wallet-track paper position for each coin a caller was just seen buying: one per
-    caller and coin at a time (they often buy the same coin several times in a minute)."""
-    while True:
-        try:
-            caller, coin, sol, spent_ms, named_ms = BOUGHT.get_nowait()
-        except queue.Empty:
-            return
-        key = f"wallet:{caller}:{coin}"
-        if key in state["positions"]:
-            continue
-        if sum(p.get("via") == "wallet" for p in state["positions"].values()) >= WALLET_MAX_OPEN:
-            state["wallet_full"] = state.get("wallet_full", 0) + 1
-            log.info("WALLET TRACK full (%d open): %s's buy of %s not tracked", WALLET_MAX_OPEN, caller, coin)
-            continue
-        state["positions"][key] = dict(new_position(caller, {"calloutId": key, "coinMint": coin,
-                                                             "createdAt": spent_ms}, named_ms, "wallet"),
-                                       sol=round(sol, 4))
-        log.info("WALLET TRACK: %s bought %s; paper buy 2 s after we named it, priced in %d min", caller, coin,
-                 WALLET_FIRST_S // 60)
 
 
 def step(api, state):
@@ -550,8 +488,7 @@ def step(api, state):
     api.wait()
     now_ms = api.now_ms()
     take_pushed(state, now_ms)
-    take_bought(state)
-    kind, pos = pick(state, now_ms, PENDING, api.room())
+    kind, pos = pick(state, now_ms, PENDING)
     if kind == "position":
         update(api, state, pos, now_ms)
     elif kind == "sol":
@@ -722,7 +659,6 @@ def bought_coins(rpc_url, wallet, slot):
 
 
 async def name_coins(rpc_url, caller, sol, slot, mints):
-    spent_ms = int(time.time() * 1000)   # when the balance drop came in
     try:
         coins = await asyncio.to_thread(bought_coins, rpc_url, CALLERS[caller][1], slot)
     except Exception as exc:   # type only: a requests error message holds the RPC URL and key
@@ -733,7 +669,6 @@ async def name_coins(rpc_url, caller, sol, slot, mints):
         prev = mints.get(coin)
         before = prev[2] if prev and prev[0] == caller and prev[1] >= now else 0
         mints[coin] = (caller, now + MINT_WATCH_MIN * 60_000, before + sol / len(coins))
-        BOUGHT.put((caller, coin, sol / len(coins), spent_ms, now))
     for coin, (_, t, _) in list(mints.items()):
         if t < now:
             del mints[coin]
@@ -759,7 +694,7 @@ async def watch(wss_url, rpc_url, mints):
     import websockets
     # Balances survive reconnects, so a drop during one still shows. They are read before the
     # first subscription: otherwise a caller's first change after a start only set the baseline,
-    # and a buy then was missed by the wallet track and the push alarm alike.
+    # and a buy then gave its callout no push alarm.
     last, delay, tasks = {}, 1, set()
     while True:
         try:
@@ -816,20 +751,20 @@ def run():
     if env.get("SOLANA_WSS_URL") and env.get("SOLANA_RPC_URL"):
         threading.Thread(target=asyncio.run, args=(live(env["SOLANA_WSS_URL"], env["SOLANA_RPC_URL"]),),
                          name="live", daemon=True).start()
-        log.info("WALLET TRACK on, kept apart: a paper buy of every coin a caller buys (Solana), scored by the same "
-                 "rules with requests the callouts do not need (state/wallet_trades.jsonl)")
     else:
-        log.warning("no SOLANA_WSS_URL/SOLANA_RPC_URL in .env: push matching and the wallet track OFF, callouts "
-                    "seen in 7-14 s")
+        log.warning("no SOLANA_WSS_URL/SOLANA_RPC_URL in .env: push matching OFF, callouts seen in 7-14 s")
     api, state, beat = Api(), load(), 0.0
     state.pop("sol_ms", None)   # the price itself is not saved: fetch it now, the alarm's size check needs it
     # Earlier versions opened positions on unconfirmed push matches, mostly strangers' callouts.
     # Now a position opens only once the feed confirms the caller, so those are not this strategy.
-    drop = [k for k, p in state["positions"].items() if p.get("via") == "push" and p.get("author_ok") is not True]
+    # The wallet track was removed on 2026-10-08: its open positions would otherwise be scored as callouts.
+    drop = [k for k, p in state["positions"].items()
+            if p.get("via") == "wallet" or (p.get("via") == "push" and p.get("author_ok") is not True)]
     for k in drop:
         del state["positions"][k]
+    state.pop("wallet_full", None)
     if drop:
-        log.info("dropped %d open paper positions opened on unconfirmed push matches", len(drop))
+        log.info("dropped %d open paper positions: wallet-track ones, or opened on unconfirmed push matches", len(drop))
     try:
         while True:
             try:
@@ -845,16 +780,15 @@ def run():
             if time.time() - beat >= 900:   # a heartbeat, so a quiet log still shows the bot is alive
                 beat = time.time()
                 watched = [f"{c}:{m[:6]}" for m, (c, t, _) in dict(MINTS).items() if t > beat * 1000]
-                wallet = sum(p.get("via") == "wallet" for p in state["positions"].values())
-                log.info("alive: %d open paper positions, %d on the wallet track; coins watched for a push alarm: %s",
-                         len(state["positions"]) - wallet, wallet, ", ".join(watched) or "none yet")
+                log.info("alive: %d open paper positions; coins watched for a push alarm: %s",
+                         len(state["positions"]), ", ".join(watched) or "none yet")
     except KeyboardInterrupt:
         save(state)
         log.info("stopped; %d open paper positions saved", len(state["positions"]))
 
 
-def read_trades(name="trades.jsonl"):
-    path = os.path.join(STATE_DIR, name)
+def read_trades():
+    path = os.path.join(STATE_DIR, "trades.jsonl")
     if not os.path.exists(path):
         return []
     with open(path, encoding="utf-8") as f:
@@ -866,16 +800,14 @@ def read_trades(name="trades.jsonl"):
     return trades
 
 
-def history(wallet=False):
+def history():
     """Every trade on a confirmed callout: the buy, each sell with its fee and tip,
     and the result per rule. Also writes state/history.csv (one row per buy or sell;
-    its net column adds up to each trade's result). With wallet=True, the same for the
-    wallet track (state/wallet_history.csv; its "callout" column is their balance drop)."""
+    its net column adds up to each trade's result)."""
     rows = [["trade", "callout", "caller", "chain", "coin", "via", "seen_after_s", "rule", "action", "time", "share",
              "multiple", "price_usd", "value_usd", "fee_usd", "tip_usd", "net_usd", "reason"]]
     chain_name = {caip2: name for name, caip2 in CHAINS.items()}
-    trades = [t for t in read_trades("wallet_trades.jsonl" if wallet else "trades.jsonl")
-              if t.get("author_ok", True) is True]   # older trades predate the check
+    trades = [t for t in read_trades() if t.get("author_ok", True) is True]   # older trades predate the check
 
     def when(ms):
         return datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
@@ -886,14 +818,9 @@ def history(wallet=False):
         bought = t.get("entry_ms") or t["seen_ms"] + EXEC_DELAY_S * 1000
         chain = chain_name.get(t.get("chain", SOL), t.get("chain"))
         head = [n, when(t["callout_ms"]), t["caller"], chain, t["mint"], t.get("via") or "list", round(lag, 1)]
-        if wallet:
-            print(f"\n#{n} {when(t['callout_ms'])}  {t['caller']} bought {t['mint']} for {t.get('sol') or 0:.2f} SOL; "
-                  f"coin named {lag:.1f}s later; "
-                  + (f"they called it {(t['called_ms'] - t['callout_ms']) / 1000:.0f}s after buying"
-                     if t.get("called_ms") else "not called while held"))
-        else:
-            print(f"\n#{n} {when(t['callout_ms'])}  {t['caller']} called {t['mint']} ({chain}) at "
-                  f"${t.get('mcap') or 0:,.0f} market cap; seen {lag:.1f}s later via {t.get('via') or 'the old per-caller list'}")
+        print(f"\n#{n} {when(t['callout_ms'])}  {t['caller']} called {t['mint']} ({chain}) at "
+              f"${t.get('mcap') or 0:,.0f} market cap; seen {lag:.1f}s later via {t.get('via') or 'the old per-caller list'}"
+              + ("  [scored afterwards: pump.fun's prices came too late]" if t.get("replayed") else ""))
         print(f"   BUY  {when(bought)}  ${STAKE_USD:.2f} = fee ${STAKE_USD * COST:.2f} + ${STAKE_USD * (1 - COST):.2f}"
               f" for {tokens:,.0f} tokens at ${entry:.4g}; tip ${TIP_USD:.2f}")
         for name, result in t["pnl"].items():
@@ -918,7 +845,7 @@ def history(wallet=False):
         print(f"\nTotals over {len(trades)} trades ($100 each):")
         for name, total in totals.items():
             print(f"   {name:<36} {total:+9.2f}")
-    path = os.path.join(STATE_DIR, "wallet_history.csv" if wallet else "history.csv")
+    path = os.path.join(STATE_DIR, "history.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerows(rows)
     print(f"\nwritten to {path} (opens in Excel)")
@@ -935,10 +862,8 @@ def by_rule(label, group):
 
 
 def report():
-    trades, state = read_trades(), load()
-    held = list(state["positions"].values())
-    print(f"{len(trades)} closed paper trades, {sum(p.get('via') != 'wallet' for p in held)} open, "
-          f"${STAKE_USD:.0f} each")
+    trades = read_trades()
+    print(f"{len(trades)} closed paper trades, {len(load()['positions'])} open, ${STAKE_USD:.0f} each")
     wrong = sum(t.get("author_ok") is False for t in trades)
     unsure = sum("author_ok" in t and t["author_ok"] is None for t in trades)
     if wrong or unsure:
@@ -958,20 +883,11 @@ def report():
             print(f"\ncallout seen after posting, via {via or 'the old per-caller list'}: median "
                   f"{statistics.median(lag):.1f}s, p95 {lag[math.ceil(0.95 * len(lag)) - 1]:.1f}s, max {lag[-1]:.1f}s"
                   f"  (n={len(lag)})")
-    wallet = read_trades("wallet_trades.jsonl")
-    print(f"\n\nWALLET TRACK (a paper buy of every coin a caller buys, 2 s after the bot names it): "
-          f"{len(wallet)} closed, {sum(p.get('via') == 'wallet' for p in held)} open, "
-          f"{state.get('wallet_full', 0)} buys not tracked because {WALLET_MAX_OPEN} were open")
-    by_rule("all", wallet)
-    by_rule("coins they called while we held them", [t for t in wallet if t.get("called_ms")])
-    by_rule("coins not called while we held them", [t for t in wallet if not t.get("called_ms")])
-    for caller in CALLERS:   # schoen called 4 of 73 coins he bought on 2026-10-06/07, SoloFNF 7 of 11
-        by_rule(f"{caller}'s buys", [t for t in wallet if t["caller"] == caller])
-    lag = sorted((t["seen_ms"] - t["callout_ms"]) / 1000 for t in wallet)
-    if lag:
-        print(f"\ncoin named after their balance dropped: median {statistics.median(lag):.1f}s, max {lag[-1]:.1f}s")
+    replayed = sum(bool(t.get("replayed")) for t in good)
+    if replayed:
+        print(f"\n{replayed} of these were scored afterwards: pump.fun's prices came over 10 min late and an older "
+              f"version gave up on them")
 
 
 if __name__ == "__main__":
-    {"report": report, "history": lambda: history(sys.argv[2:] == ["wallet"])}.get(
-        sys.argv[1] if sys.argv[1:] else "", run)()
+    {"report": report, "history": history}.get(sys.argv[1] if sys.argv[1:] else "", run)()
