@@ -78,7 +78,6 @@ CALLERS = {  # name: (pump.fun profile id, Solana wallet)
     # added 2026-10-07 from Ashish's invite links (join.pump.fun -> pump.fun/profile/<id>; wallet from the page,
     # checked against the profile's own callout list)
     "spuno": ("161a6705-a007-4151-811f-c21a71733360", "GfXQesPe3Zuwg8JhAt6Cg8euJDTVx751enp9EQQmhzPH"),
-    "untaxxable": ("c262a0de-4e69-4c2b-be93-85b9eef4231e", "2T5NgDDidkvhJQg8AHDi74uCFwgp25pYFMRZXBaCUNBH"),
     "KayThedoc": ("fd1bf406-c7b4-4d7f-910a-54537f4813ad", "DYAn4XpAkN5mhiXkRB7dGq4Jadnx6XYgu8L5b3WGhbrt"),
     "mitch": ("b8f1ac45-55b5-4704-919a-fb7105e59dc5", "4Be9CvxqHW6BYiRAxW9Q3xu1ycTMWaL5z8NX4HR3ha7t"),
     "FlippingProfits": ("76129303-d90d-45f9-ae69-8c749505f90d", "DdM1tyCdoEyoxYYmGMjdf5rRPcpmj3UzZTpE7ScuTf7d"),
@@ -88,8 +87,12 @@ CALLERS = {  # name: (pump.fun profile id, Solana wallet)
     "croakie": ("09d6f634-beb7-436e-9e41-7b9061f9673f", "7fEXteaTtmX1uR8fpChEXsevM4icH5vq8LNL9dzDupX2"),
     "J777Crypto": ("1e2df2f0-4720-4edb-a6d2-dd2833300de9", "4UrFSCrGxgoCtCUBAEZq7ZmPK3Pczkxx7PwYnkBMi1KR"),
     "cooker": ("88126e6e-497b-4cf8-8bcc-fdacf422431f", "8deJ9xeUvXSJwicYptA9mHsU2rN2pDx37KWzkDkEXhU6"),
-    "_logjam": ("bf9041db-31a9-4d3c-9bfa-7b9e0cde1512", "AH39BneW9UeWxQysUcwogQrYFdPvJuRVZ5w4ccq9SKfL"),
-    "jackduvalcalls": ("cef4bed6-680b-491c-8089-1f3c6bfe763b", "BAr5csYtpWoNpwhUjixX7ZPHXkUciFZzjBp9uNxZXJPh"),
+    # added 2026-10-09 (same check)
+    "collectible": ("0eb63fdd-0e25-4990-8d17-5016d3adfead", "EnPjBjzy6zaufzpZ2m3Q8nPS3KpyiRxNLKtcSiMYwWCa"),
+    "swayzeeee": ("6ba0ce51-0f91-414f-bec5-a7e619aa245c", "6rq8QHA89oeaPix1jUP7raHJ9HwNejUVCzwdwmpqcMhe"),
+    "daumen": ("1aa084f0-8044-4ba4-bdcc-0235e4c06d6d", "8MaVa9kdt3NW4Q5HyNAm1X5LbR8PQRVDc1W8NMVK88D5"),
+    # removed 2026-10-09 for losing on paper (main rule, $100 a trade): untaxxable -412.28 (3/17 won),
+    # _logjam -105.69 (2/7), jackduvalcalls -85.16 (2/5)
 }
 BY_PROFILE = {profile: name for name, (profile, _) in CALLERS.items()}
 
