@@ -91,6 +91,10 @@ CALLERS = {  # name: (pump.fun profile id, Solana wallet)
     "collectible": ("0eb63fdd-0e25-4990-8d17-5016d3adfead", "EnPjBjzy6zaufzpZ2m3Q8nPS3KpyiRxNLKtcSiMYwWCa"),
     "swayzeeee": ("6ba0ce51-0f91-414f-bec5-a7e619aa245c", "6rq8QHA89oeaPix1jUP7raHJ9HwNejUVCzwdwmpqcMhe"),
     "daumen": ("1aa084f0-8044-4ba4-bdcc-0235e4c06d6d", "8MaVa9kdt3NW4Q5HyNAm1X5LbR8PQRVDc1W8NMVK88D5"),
+    "xet": ("dbd6f397-f469-47cf-aa76-83901879ed2e", "6HRXKEeHWC8D3UUy49Ug3dy6Yz7X2MY1mNykL36WmMvu"),
+    "traderpow": ("dc0c8373-d1af-402c-af69-9ae58d54daa0", "3NbL2gNYoZ2fXnpsxNwMWdpHhw2f9tfbSxBR5JwcWpKY"),
+    "retardedgains": ("9d412d45-6eed-474a-99dc-3092c30ed534", "9djgawmgpGrzt7DQoJ6tA2YW4gQyt3yH19uVZ3e2T3JJ"),
+    "edward": ("37cb3b4f-ffed-4e77-a447-3c319b1753d3", "C4Svaa7djC8d3CVxaohrsedccaKqimNoJrWe9iNPdix5"),
     # removed 2026-10-09 for losing on paper (main rule, $100 a trade): untaxxable -412.28 (3/17 won),
     # _logjam -105.69 (2/7), jackduvalcalls -85.16 (2/5)
 }
