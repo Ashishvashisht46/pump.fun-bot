@@ -14,6 +14,14 @@ robinhood-bot AD-050). The main rule needs the callout within ~5 s. A paper trac
 that bought every coin they bought (2026-10-07/08, commits a022218-fc6ee95) lost
 -$1,808 over 148 trades and was removed; its trades stay in state/wallet_trades.jsonl.
 
+CALM-45, a second paper track beside the unchanged one (the control): the strategy
+research of 2026-10-10 (196 trades, ~6,950 rules, none proven) found one idea worth a
+forward test. Copy bots pump a coin before and just after its callout; Calm-45 waits 45 s
+and buys only if the price stayed within a 10% range since the callout, then sells all at
++30% with a stop at 0.8x. Its own files: state/calm_trades.jsonl and calm_skips.jsonl.
+Parameters are frozen; `report` compares it with the control over the same period, at the
+paper tip ($1) and a realistic one ($0.15). Paper only, whatever it shows.
+
 How it sees a callout within ~2 s:
 - PUSH: pump.fun's website gets every new callout pushed over its public NATS
   websocket (homeFeedNew.head.solana.prod, with the public 'subscriber' login that
@@ -118,6 +126,10 @@ EVM_ALARM_USD = 300      # no wallet watch on EVM chains, and ~5 EVM callouts a 
                          # to ask the feed about: only those with a position this big (top ~10% site-wide;
                          # marcell's Solana buys run in the thousands) get asked about at once
 LIMIT_MIN = 60           # anything still held after this is sold at the market
+CALM_WAIT_S = 45         # Calm-45: decide this long after the callout (or when we saw it, if later)...
+CALM_RANGE = 0.10        # ...buying only if its high-low range since the callout stayed within this of the price then
+CALM_RULES = {"calm-45: all at +30%, stop 0.8x": ([(1.0, 1.3)], 0.8, None, None)}   # FROZEN with the two above
+REAL_TIP_USD = 0.15      # the report also books every trade at this tip (priority fee, no Jito tip)
 
 RULES = {  # name: ([(fraction to sell, at this multiple of our fill)], stop multiple,
            #        stop multiple once a target has sold, trailing stop on the rest once a target has sold)
@@ -272,6 +284,7 @@ def poll_feed(api, state):
             continue
         out.append((caller, {"calloutId": cid, "coinMint": row["coinMint"], "createdAt": created,
                              "chain": CHAINS[row["chain"]], "marketCap": c.get("calledOutAtMcap"),
+                             "calloutPrice": c.get("calloutPrice"),
                              "size_ratio": alarm and alarm[1]}, "push" if alarm else "feed", now_ms))
     for cid, (give_up, _) in list(PENDING.items()):
         if give_up < now_ms:
@@ -292,14 +305,16 @@ def take_pushed(state, now_ms):
             got = True
 
 
-def new_position(caller, c, seen_ms, via):
+def new_position(caller, c, seen_ms, via, rules=RULES, decide_ms=None):
+    """A paper position. It buys at decide_ms (when the callout was seen, unless a track
+    waits) and lands EXEC_DELAY_S later."""
     return {"id": c["calloutId"], "caller": caller, "mint": c["coinMint"], "chain": c.get("chain", SOL),
-            "callout_ms": c["createdAt"], "seen_ms": seen_ms, "via": via, "author_ok": True,
-            "size_ratio": c.get("size_ratio"),
+            "callout_ms": c["createdAt"], "seen_ms": seen_ms, "decide_ms": decide_ms or seen_ms, "via": via,
+            "author_ok": True, "size_ratio": c.get("size_ratio"), "call_price": c.get("calloutPrice"),
             "mcap": c.get("marketCap"), "entry": None, "tokens": None,
             "last_bar_ms": None, "last_close": None, "checked_ms": 0,
             "rules": {name: {"left": 1.0, "hit": [False] * len(rule[0]), "proceeds": 0.0, "sells": 0, "done": False}
-                      for name, rule in RULES.items()}}
+                      for name, rule in rules.items()}}
 
 
 # ---- prices and exits ------------------------------------------------------------
@@ -340,7 +355,7 @@ def apply_bar(pos, bar):
     for name, r in pos["rules"].items():
         if r["done"]:
             continue
-        legs, stop, after, trail = {**RETIRED, **RULES}[name]
+        legs, stop, after, trail = {**RETIRED, **RULES, **CALM_RULES}[name]
         level = entry * r.get("stop", stop)
         why = f"stop {r.get('stop', stop):g}x"
         if trail and any(r["hit"]) and r.get("peak", entry) * (1 - trail) > level:
@@ -374,6 +389,27 @@ def settle_ms(chain):
     return (5 if chain == SOL else 60) * 1000
 
 
+def calm_gate(bs, pos):
+    """The Calm-45 entry test (rule C1 of the 2026-10-10 research): None to buy, else why
+    not. p0 is the last price at or before the callout; the high-low range of the 1 s bars
+    completed between the callout and the decision, plus the last price before deciding,
+    must stay within CALM_RANGE of p0. A p0 far below the caller's posted price means a
+    broken feed: a frozen EVM feed once 'bought' at half the posted price (2026-10-10)."""
+    c, dm = pos["callout_ms"], pos["decide_ms"]
+    before = [b[5] for b in bs if b[0] + b[1] - 1000 <= c]
+    if not before:
+        return "no price before the callout"
+    p0 = before[-1]
+    if pos.get("call_price") and p0 < 0.8 * pos["call_price"]:
+        return "price feed below 0.8x the posted call price"
+    cur = [b[5] for b in bs if b[0] + b[1] - 1000 <= dm - 1000][-1]
+    window = [b for b in bs if b[0] >= c and b[0] + b[1] <= dm]
+    hi = max([b[3] for b in window] + [cur]) / p0 - 1
+    lo = min([b[4] for b in window] + [cur]) / p0 - 1
+    pos.update(p0=p0, calm_range=round(hi - lo, 4), active_bars=sum(b[1] == 1000 for b in window))
+    return None if hi - lo <= CALM_RANGE else f"moved {hi - lo:.0%} in {(dm - c) / 1000:.0f} s"
+
+
 def update(api, state, pos, now_ms):
     """Price a position from its bars. Exits are scored after the fact, so a
     position needs a request only every few minutes: late is fine, as long as no
@@ -381,7 +417,9 @@ def update(api, state, pos, now_ms):
     pos["checked_ms"] = now_ms
     chain = pos.get("chain", SOL)
     trusted = now_ms - settle_ms(chain)
-    landed = pos["seen_ms"] + EXEC_DELAY_S * 1000
+    decide = pos.get("decide_ms") or pos["seen_ms"]   # positions saved by older versions have none
+    landed = decide + EXEC_DELAY_S * 1000
+    calm = pos.get("track") == "calm"
     # A buy is priced from bars around it, which then never scroll out of a 300-bar answer.
     raw = bars(api, chain, pos["mint"], now_ms if pos["entry"] is not None else min(now_ms, landed + 240_000), 300)
     bs = [b for b in raw or [] if b[0] + b[1] - 1000 <= trusted]
@@ -396,16 +434,24 @@ def update(api, state, pos, now_ms):
                 log.warning("no price data past the buy for %s after 60 min; dropping it", pos["mint"])
                 del state["positions"][pos["id"]]
             return
-        price = fill_price(bs, pos["seen_ms"], landed)
+        if calm and (why := calm_gate(bs, pos)):
+            record("calm_skips.jsonl", {k: pos.get(k) for k in ("id", "caller", "mint", "chain", "callout_ms",
+                                                                  "seen_ms", "decide_ms", "call_price", "p0",
+                                                                  "calm_range", "active_bars")} | {"why": why})
+            log.info("CALM-45 skips %s (%s): %s", pos["mint"], pos["caller"], why)
+            del state["positions"][pos["id"]]
+            return
+        price = fill_price(bs, decide, landed)
         if price is None:
             log.warning("no trade before the buy for %s; dropping it", pos["mint"])
             del state["positions"][pos["id"]]
             return
         pos.update(entry=price, entry_ms=landed, tokens=STAKE_USD * (1 - COST) / price, last_close=price,
                    last_bar_ms=max([b[0] for b in bs if b[0] <= landed] or [landed - 1000]))
-        log.info("PAPER BUY $%.0f of %s (called by %s) at $%.3g; callout seen %.1fs after posting, via %s",
-                 STAKE_USD, pos["mint"], pos["caller"], price, (pos["seen_ms"] - pos["callout_ms"]) / 1000,
-                 pos.get("via", "list"))
+        log.info("%sPAPER BUY $%.0f of %s (called by %s) at $%.3g; callout seen %.1fs after posting, via %s%s",
+                 "CALM-45 " if calm else "", STAKE_USD, pos["mint"], pos["caller"], price,
+                 (pos["seen_ms"] - pos["callout_ms"]) / 1000, pos.get("via", "list"),
+                 f"; range {pos['calm_range']:.0%} in the first {(decide - pos['callout_ms']) / 1000:.0f} s" if calm else "")
     elif raw is None:
         return   # no answer: nothing learned (and no sign the coin stopped trading); the next look resumes here
     elif len(raw) == 300 and raw[0][0] > pos["last_bar_ms"] + 1000:
@@ -439,11 +485,12 @@ def update(api, state, pos, now_ms):
                  "callout_ms": pos["callout_ms"], "seen_ms": pos["seen_ms"], "via": pos.get("via"),
                  "author_ok": pos.get("author_ok"), "size_ratio": pos.get("size_ratio"), "entry": pos["entry"],
                  "entry_ms": pos["entry_ms"], "tokens": pos["tokens"],
+                 **{k: pos[k] for k in ("decide_ms", "call_price", "p0", "calm_range", "active_bars") if k in pos},
                  "fills": {name: r.get("fills", []) for name, r in pos["rules"].items()},
                  "pnl": {name: round(pnl(r), 2) for name, r in pos["rules"].items()}}
-        record("trades.jsonl", trade)
+        record("calm_trades.jsonl" if calm else "trades.jsonl", trade)
         del state["positions"][pos["id"]]
-        log.info("CLOSED %s (%s): %s", pos["mint"], pos["caller"],
+        log.info("%sCLOSED %s (%s): %s", "CALM-45 " if calm else "", pos["mint"], pos["caller"],
                  " | ".join(f"{k}: {v:+.2f}" for k, v in trade["pnl"].items()))
 
 
@@ -467,7 +514,7 @@ def pick(state, now_ms, pending):
         return "feed", None
     held = [p for p in state["positions"].values() if p["entry"] is not None]
     waiting = [p for p in state["positions"].values() if p["entry"] is None
-               and now_ms >= p["seen_ms"] + EXEC_DELAY_S * 1000 + settle_ms(p.get("chain", SOL)) + 1000
+               and now_ms >= (p.get("decide_ms") or p["seen_ms"]) + EXEC_DELAY_S * 1000 + settle_ms(p.get("chain", SOL)) + 1000
                and now_ms - p["checked_ms"] >= (10_000 if now_ms - p["seen_ms"] < 120_000 else
                                                 30_000 if now_ms - p["seen_ms"] < 600_000 else 120_000)]
     urgent = ([p for p in held if now_ms - p["checked_ms"] >= 240_000]
@@ -485,7 +532,11 @@ def pick(state, now_ms, pending):
 
 
 def open_position(state, caller, c, seen_ms, via):
+    """The control's position, and Calm-45's, which decides CALM_WAIT_S after the callout."""
     state["positions"][c["calloutId"]] = new_position(caller, c, seen_ms, via)
+    calm = new_position(caller, c, seen_ms, via, CALM_RULES, max(c["createdAt"] + CALM_WAIT_S * 1000, seen_ms))
+    calm.update(id=f"calm:{c['calloutId']}", track="calm")
+    state["positions"][calm["id"]] = calm
     log.info("CALLOUT %s -> %s (mcap $%s) via %s, seen %.1fs after posting%s", caller, c["coinMint"],
              f"{c.get('marketCap') or 0:,.0f}", via, (seen_ms - c["createdAt"]) / 1000,
              f"; their position is {c['size_ratio']:.2f}x what they spent" if c.get("size_ratio") else "")
@@ -789,15 +840,16 @@ def run():
             if time.time() - beat >= 900:   # a heartbeat, so a quiet log still shows the bot is alive
                 beat = time.time()
                 watched = [f"{c}:{m[:6]}" for m, (c, t, _) in dict(MINTS).items() if t > beat * 1000]
-                log.info("alive: %d open paper positions; coins watched for a push alarm: %s",
-                         len(state["positions"]), ", ".join(watched) or "none yet")
+                calm = sum(p.get("track") == "calm" for p in state["positions"].values())
+                log.info("alive: %d open paper positions, %d Calm-45 deciding or open; coins watched for a push "
+                         "alarm: %s", len(state["positions"]) - calm, calm, ", ".join(watched) or "none yet")
     except KeyboardInterrupt:
         save(state)
         log.info("stopped; %d open paper positions saved", len(state["positions"]))
 
 
-def read_trades():
-    path = os.path.join(STATE_DIR, "trades.jsonl")
+def read_trades(name="trades.jsonl"):
+    path = os.path.join(STATE_DIR, name)
     if not os.path.exists(path):
         return []
     with open(path, encoding="utf-8") as f:
@@ -860,19 +912,60 @@ def history():
     print(f"\nwritten to {path} (opens in Excel)")
 
 
-def by_rule(label, group):
+def at_tip(t, name, tip):
+    """A trade's result for rule `name` had each transaction (the buy and every sell) cost
+    `tip` instead of TIP_USD; None for trades recorded without their sells."""
+    fills = (t.get("fills") or {}).get(name)
+    return None if fills is None else t["pnl"][name] + (TIP_USD - tip) * (1 + len(fills))
+
+
+def by_rule(label, group, rules=RULES):
     if group:
         print(f"\n{label}: {len(group)} trades")
-    for name in RULES:
+    for name in rules:
         xs = [t["pnl"][name] for t in group if name in t["pnl"]]
+        real = [x for t in group if name in t["pnl"] and (x := at_tip(t, name, REAL_TIP_USD)) is not None]
         if xs:
             print(f"  {name:<36} wins {sum(x > 0 for x in xs):>3}/{len(xs):<3}  total {sum(xs):+9.2f}  "
-                  f"avg {sum(xs) / len(xs):+7.2f}")
+                  f"avg {sum(xs) / len(xs):+7.2f}"
+                  + (f"  | at ${REAL_TIP_USD:.2f} tips: avg {sum(real) / len(real):+7.2f}" if real else ""))
+
+
+def calm_report(good):
+    """Calm-45 against the control over the same period: what its stop rules look at."""
+    calm, skips = read_trades("calm_trades.jsonl"), read_trades("calm_skips.jsonl")
+    deciding = sum(p.get("track") == "calm" for p in load()["positions"].values())
+    print(f"\n\nCALM-45 (paper experiment: wait {CALM_WAIT_S} s, buy only if the price stayed within {CALM_RANGE:.0%}; "
+          f"all at +30%, stop 0.8x): {len(calm)} closed, {deciding} deciding or open, {len(skips)} skipped")
+    if skips:
+        why = collections.Counter("moved more than 10%" if s["why"].startswith("moved") else s["why"] for s in skips)
+        print("  skipped: " + "; ".join(f"{n} {w}" for w, n in why.most_common()))
+    if not calm:
+        return
+    name, main = next(iter(CALM_RULES)), next(iter(RULES))
+    by_rule("Calm-45 trades", calm, CALM_RULES)
+    xs = sorted((t["pnl"][name] for t in calm), reverse=True)
+    active = [t["pnl"][name] for t in calm if (t.get("active_bars") or 0) >= 6]
+    quiet = [t["pnl"][name] for t in calm if (t.get("active_bars") or 0) < 6]
+    print(f"  without its best 2 trades: {sum(xs[2:]):+.2f}; coins trading in the window (6+ seconds with trades): "
+          f"{len(active)} trades {sum(active):+.2f}; nearly inactive: {len(quiet)} trades {sum(quiet):+.2f}")
+    since = min(t["callout_ms"] for t in calm + skips)
+    ctrl = [t for t in good if t["callout_ms"] >= since and main in t["pnl"]]
+    if ctrl:
+        real = [x for t in ctrl if (x := at_tip(t, main, REAL_TIP_USD)) is not None]
+        calm_real = [x for t in calm if (x := at_tip(t, name, REAL_TIP_USD)) is not None]
+        print(f"  control over the same period: {len(ctrl)} trades, main rule avg "
+              f"{sum(t['pnl'][main] for t in ctrl) / len(ctrl):+.2f} (at ${REAL_TIP_USD:.2f} tips "
+              f"{sum(real) / max(1, len(real)):+.2f}) vs Calm-45 {sum(xs) / len(xs):+.2f} "
+              f"({sum(calm_real) / max(1, len(calm_real)):+.2f})")
+    print(f"  stop rule at 30 trades: Calm-45's avg at ${REAL_TIP_USD:.2f} tips must be above 0 and at least $3 "
+          f"better than the control's")
 
 
 def report():
     trades = read_trades()
-    print(f"{len(trades)} closed paper trades, {len(load()['positions'])} open, ${STAKE_USD:.0f} each")
+    print(f"{len(trades)} closed paper trades, {sum(p.get('track') != 'calm' for p in load()['positions'].values())} "
+          f"open, ${STAKE_USD:.0f} each")
     wrong = sum(t.get("author_ok") is False for t in trades)
     unsure = sum("author_ok" in t and t["author_ok"] is None for t in trades)
     if wrong or unsure:
@@ -896,6 +989,7 @@ def report():
     if replayed:
         print(f"\n{replayed} of these were scored afterwards: pump.fun's prices came over 10 min late and an older "
               f"version gave up on them")
+    calm_report(good)
 
 
 if __name__ == "__main__":

@@ -514,6 +514,82 @@ class History(unittest.TestCase):
         self.assertNotIn("3", {r["trade"] for r in rows})
 
 
+class Calm45(unittest.TestCase):
+    T = 1_000_000_000                                    # the callout, in ms
+    CALM = next(iter(bot.CALM_RULES))
+
+    def calm_position(self, call_price=1.0, seen_after_ms=1_500):
+        state = {"seen": {}, "positions": {}}
+        bot.open_position(state, "schoen", {"calloutId": "k", "coinMint": "M", "createdAt": self.T,
+                                            "calloutPrice": call_price}, self.T + seen_after_ms, "push")
+        del state["positions"]["k"]                      # the control's position: tested elsewhere
+        return state, state["positions"]["calm:k"]
+
+    def quiet_coin(self, window_high=1.08):
+        s = self.T // 1000
+        return [bar(s - 10, 1.0, 1.0, 1.0, 1.0),          # the price before the callout: p0 = 1.0
+                bar(s + 5, 1.0, 1.03, 0.99, 1.02),
+                bar(s + 30, 1.02, window_high, 1.0, 1.03),  # range so far: 0.99 .. window_high (9%)
+                bar(s + 46, 1.03, 1.05, 1.03, 1.04),        # inside the landing window after 45 s: pays 1.05
+                bar(s + 60, 1.2, 1.5, 1.2, 1.45)]           # +30% on the fill: sells everything
+
+    def test_every_callout_also_opens_a_calm_position_deciding_45_s_after_it(self):
+        state, p = self.calm_position()
+        self.assertEqual((p["decide_ms"], p["call_price"], list(p["rules"])), (self.T + 45_000, 1.0, [self.CALM]))
+        _, late = self.calm_position(seen_after_ms=50_000)
+        self.assertEqual(late["decide_ms"], self.T + 50_000)           # seen after 45 s: decides at once
+        state.update(feed_ms=self.T + 60_000, sol_ms=self.T + 60_000)
+        ready = self.T + 45_000 + bot.EXEC_DELAY_S * 1000 + bot.settle_ms(bot.SOL) + 1000
+        self.assertEqual(bot.pick(state, ready - 1, {}), (None, None))  # its bars are not complete yet
+        self.assertEqual(bot.pick(state, ready, {}), ("position", p))
+
+    def test_a_calm_coin_is_bought_after_45_s_and_kept_apart_from_the_control(self):
+        with tempfile.TemporaryDirectory() as d:
+            bot.STATE_DIR = d
+            state, p = self.calm_position()
+            bot.update(FakeApi(candles=self.quiet_coin()), state, p, self.T + 120_000)
+            self.assertEqual(state["positions"], {})                     # bought, then +30% sold it all
+            [t] = bot.read_trades("calm_trades.jsonl")
+            self.assertEqual(bot.read_trades(), [])                       # nothing in the control's file
+            self.assertEqual((t["entry"], t["entry_ms"], t["p0"], t["calm_range"], t["active_bars"]),
+                             (1.05, self.T + 47_000, 1.0, 0.09, 2))          # not the 1.08 seen before deciding
+            tokens = bot.STAKE_USD * (1 - bot.COST) / 1.05
+            self.assertAlmostEqual(t["pnl"][self.CALM], round(tokens * 1.05 * 1.3 * (1 - bot.COST) - bot.STAKE_USD
+                                                               - 2 * bot.TIP_USD, 2))
+
+    def test_a_coin_that_moved_more_than_10_percent_or_a_broken_feed_is_skipped(self):
+        for kwargs, coin, why in (({}, self.quiet_coin(window_high=1.2), "moved 21% in 45 s"),
+                                  ({"call_price": 2.0}, self.quiet_coin(), "price feed below 0.8x the posted call price")):
+            with tempfile.TemporaryDirectory() as d:
+                bot.STATE_DIR = d
+                state, p = self.calm_position(**kwargs)
+                bot.update(FakeApi(candles=coin), state, p, self.T + 120_000)
+                self.assertEqual(state["positions"], {})
+                [skip] = bot.read_trades("calm_skips.jsonl")
+                self.assertEqual(skip["why"], why)
+                self.assertEqual(bot.read_trades("calm_trades.jsonl"), [])
+
+    def test_the_report_compares_calm_45_with_the_control_at_both_tips(self):
+        with tempfile.TemporaryDirectory() as d:
+            bot.STATE_DIR = d
+            state, p = self.calm_position()
+            bot.update(FakeApi(candles=self.quiet_coin()), state, p, self.T + 120_000)
+            ctrl = position()
+            bot.apply_bar(ctrl, bar(1, 1.0, 1.35, 1.0, 1.3))
+            bot.apply_bar(ctrl, bar(2, 0.6, 0.6, 0.6, 0.6))
+            main = next(iter(bot.RULES))
+            t = {"id": "c", "caller": "schoen", "mint": "M", "mcap": 1, "callout_ms": self.T, "seen_ms": self.T + 1000,
+                 "via": "push", "author_ok": True, "entry": 1.0, "entry_ms": self.T + 3000, "tokens": TOKENS,
+                 "fills": {main: ctrl["rules"][main]["fills"]}, "pnl": {main: round(bot.pnl(ctrl["rules"][main]), 2)}}
+            bot.record("trades.jsonl", t)
+            self.assertAlmostEqual(bot.at_tip(t, main, 0.15), t["pnl"][main] + 0.85 * 3)   # a buy and 2 sells
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                bot.report()
+            text = out.getvalue()
+            for want in ("CALM-45", "1 closed", "control over the same period: 1 trades", "at $0.15 tips"):
+                self.assertIn(want, text)
+
+
 class EndToEnd(unittest.TestCase):
     def test_push_alarm_to_feed_confirmed_paper_buy_to_trade_across_a_restart(self):
         with tempfile.TemporaryDirectory() as d:
@@ -540,10 +616,14 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual(state["positions"]["x1"]["entry"], 1.05)
             api.candles.append(bar(t0 // 1000 + 4, 1.1, 2.3, 1.1, 2.2))
             api.candles.append(bar(t0 // 1000 + 6, 1.5, 1.5, 1.5, 1.5))   # back through the 30% trailing stop
+            api.candles.append(bar(t0 // 1000 + 50, 1.5, 1.5, 1.5, 1.5))  # a trade after Calm-45's landing
             api.t = t0 + 140_000
             bot.step(api, state)                                 # the feed is due first...
+            bot.step(api, state)                                 # ...then Calm-45, which waited 45 s, decides...
             bot.step(api, state)                                 # ...then the routine check: every target reached
             self.assertEqual(state["positions"], {})
+            [skip] = bot.read_trades("calm_skips.jsonl")         # this coin has no price before its callout
+            self.assertEqual((skip["id"], skip["why"]), ("calm:x1", "no price before the callout"))
             trade = read_trade(d)
             self.assertEqual((trade["via"], trade["author_ok"], trade["seen_ms"] - trade["callout_ms"], trade["size_ratio"]),
                              ("push", True, 1_800, 0.99))
