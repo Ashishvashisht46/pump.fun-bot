@@ -157,6 +157,20 @@ class ExitRules(unittest.TestCase):
         self.assertAlmostEqual(p["rules"]["main: 50% at +30%, rest trails 30%, stop to 1.05x"]["left"], 0.5)
         self.assertEqual(p["last_bar_ms"], 659_000)     # through minute 10's last second (minute 11 is too new)
 
+    def test_a_check_a_day_late_still_scores_the_positions_own_hour(self):
+        p = position(checked_ms=0, last_bar_ms=30_000)                         # bought at 0; the bot then went down
+        state = {"seen": {}, "positions": {"c1": p}}
+        busy = [bar(600 + i, 1.1, 1.1, 1.1, 1.1) for i in range(300)]          # in its hour: 300 busy seconds
+        hour = [(m * 60_000, 60_000, 1.0, 1.0, 1.0, 1.0, True) for m in range(62)]
+        day_later = ([bar(86_400 + i, 0.2, 0.2, 0.2, 0.2) for i in range(300)]           # it kept trading all day
+                     + [(m * 60_000, 60_000, 0.2, 0.2, 0.2, 0.2, True) for m in range(62, 1450)])
+        with tempfile.TemporaryDirectory() as d:
+            bot.STATE_DIR = d
+            bot.update(FakeApi(candles=busy + hour + day_later), state, p, 86_700_000)
+            trade = read_trade(d)
+        # the 60-min limit sells at the price right after the hour (1.0), not at the one a day later (0.2)
+        self.assertEqual(trade["fills"]["all at 2x"], [[3_600_000, 1.0, 1.0, "60-min limit"]])
+
     def test_no_answer_is_not_taken_for_no_trades(self):
         p = position(checked_ms=0)
         state = {"seen": {}, "positions": {"c1": p}}

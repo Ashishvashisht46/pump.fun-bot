@@ -420,8 +420,13 @@ def update(api, state, pos, now_ms):
     decide = pos.get("decide_ms") or pos["seen_ms"]   # positions saved by older versions have none
     landed = decide + EXEC_DELAY_S * 1000
     calm = pos.get("track") == "calm"
-    # A buy is priced from bars around it, which then never scroll out of a 300-bar answer.
-    raw = bars(api, chain, pos["mint"], now_ms if pos["entry"] is not None else min(now_ms, landed + 240_000), 300)
+    # Ask for no bar past what the position needs: a buy is priced from bars around it (which then never
+    # scroll out of a 300-bar answer), and a held position's bars end with its hour. A check a day late
+    # (the bot was down) then still scores its own hour: up to 300 minute bars back from NOW reached only
+    # today, and the 60-min limit sold at a price 21 h after the buy (2026-10-11).
+    upto = min(now_ms, landed + 240_000) if pos["entry"] is None else min(
+        now_ms, pos["entry_ms"] + (LIMIT_MIN + 1) * 60_000)
+    raw = bars(api, chain, pos["mint"], upto, 300)
     bs = [b for b in raw or [] if b[0] + b[1] - 1000 <= trusted]
     if pos["entry"] is None:                      # the paper buy
         if not any(b[0] > landed for b in bs):
@@ -460,8 +465,8 @@ def update(api, state, pos, now_ms):
         # seconds already scored, against a stop raised since and from an open older than them.
         edge = pos["last_bar_ms"] // 60_000 * 60_000 + 60_000
         secs = bars(api, chain, pos["mint"], edge, 61)
-        mins = None if secs is None else bars(api, chain, pos["mint"], now_ms,
-                                              min(300, math.ceil((now_ms - edge) / 60_000) + 1), "1m")
+        mins = None if secs is None else bars(api, chain, pos["mint"], upto,
+                                              min(300, math.ceil((upto - edge) / 60_000) + 1), "1m")
         if mins is None:
             return
         bs = [b for b in secs if b[0] < edge] + [b for b in mins if b[0] >= edge]
