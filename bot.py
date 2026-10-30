@@ -78,33 +78,10 @@ PUSH_SILENCE_S = 60      # a snapshot comes every ~2 s, a heartbeat every ~30 s:
                          # PINGs kept the connection looking alive)
 
 CALLERS = {  # name: (pump.fun profile id, Solana wallet)
-    "marcell": ("240b8242-5715-492e-828c-1622aac53376", "6vbrTLsWy76TxDQAUKLqZrPohQuq6EVaJgfGzR82paFa"),
-    "ily": ("e77e7b24-34ee-4a1e-9966-3fa8c27f46e8", "AcoNeFQsTPYs7ZrH8RMWaxxGJTTQJJ4H5aTXmptaz5UK"),
-    "schoen": ("cd23adcb-133e-4614-9493-535dc5c3c85a", "5hAgYC8TJCcEZV7LTXAzkTrm7YL29YXyQQJPCNrG84zM"),
-    "pxblocito": ("fb7b35f3-7815-4e7b-8985-a7d96cc403d7", "7Mwof5tBvNPC6e1zwtHRQynqXcuDpqqbeY9vSZLW2Bv8"),
-    "SoloFNF": ("d18fbf14-83bd-4331-acfe-920c81096899", "GccvEcZqMrcNdp3CarCasGdN5dUfdQ4wZ6iQsk5myRzX"),
-    # added 2026-10-07 from Ashish's invite links (join.pump.fun -> pump.fun/profile/<id>; wallet from the page,
-    # checked against the profile's own callout list)
-    "spuno": ("161a6705-a007-4151-811f-c21a71733360", "GfXQesPe3Zuwg8JhAt6Cg8euJDTVx751enp9EQQmhzPH"),
-    "KayThedoc": ("fd1bf406-c7b4-4d7f-910a-54537f4813ad", "DYAn4XpAkN5mhiXkRB7dGq4Jadnx6XYgu8L5b3WGhbrt"),
-    "mitch": ("b8f1ac45-55b5-4704-919a-fb7105e59dc5", "4Be9CvxqHW6BYiRAxW9Q3xu1ycTMWaL5z8NX4HR3ha7t"),
-    "FlippingProfits": ("76129303-d90d-45f9-ae69-8c749505f90d", "DdM1tyCdoEyoxYYmGMjdf5rRPcpmj3UzZTpE7ScuTf7d"),
-    "sapphy": ("f345034e-684f-47b5-ab1f-7ba6c81464d3", "B5TrL7PsRUwCTL5bVcueieht5QchTw4TWLQDKqEaxEzi"),
-    "hexiecs": ("046999d1-1609-4654-b8ed-06827aa50ae9", "21rgbFW6sujQovCw3qt6R2EdE97Yzzvk8sSc37Bb72Cm"),
-    "0xEthan": ("36bd4b6f-f409-4be8-a062-5058f5b23bfb", "6yVb4pxNwDfr6rovwNnBg3SyKSvDcHGD4WdFPN1JJBqm"),
-    "croakie": ("09d6f634-beb7-436e-9e41-7b9061f9673f", "7fEXteaTtmX1uR8fpChEXsevM4icH5vq8LNL9dzDupX2"),
-    "J777Crypto": ("1e2df2f0-4720-4edb-a6d2-dd2833300de9", "4UrFSCrGxgoCtCUBAEZq7ZmPK3Pczkxx7PwYnkBMi1KR"),
-    "cooker": ("88126e6e-497b-4cf8-8bcc-fdacf422431f", "8deJ9xeUvXSJwicYptA9mHsU2rN2pDx37KWzkDkEXhU6"),
-    # added 2026-10-09 (same check)
-    "collectible": ("0eb63fdd-0e25-4990-8d17-5016d3adfead", "EnPjBjzy6zaufzpZ2m3Q8nPS3KpyiRxNLKtcSiMYwWCa"),
-    "swayzeeee": ("6ba0ce51-0f91-414f-bec5-a7e619aa245c", "6rq8QHA89oeaPix1jUP7raHJ9HwNejUVCzwdwmpqcMhe"),
-    "daumen": ("1aa084f0-8044-4ba4-bdcc-0235e4c06d6d", "8MaVa9kdt3NW4Q5HyNAm1X5LbR8PQRVDc1W8NMVK88D5"),
-    "xet": ("dbd6f397-f469-47cf-aa76-83901879ed2e", "6HRXKEeHWC8D3UUy49Ug3dy6Yz7X2MY1mNykL36WmMvu"),
-    "traderpow": ("dc0c8373-d1af-402c-af69-9ae58d54daa0", "3NbL2gNYoZ2fXnpsxNwMWdpHhw2f9tfbSxBR5JwcWpKY"),
-    "retardedgains": ("9d412d45-6eed-474a-99dc-3092c30ed534", "9djgawmgpGrzt7DQoJ6tA2YW4gQyt3yH19uVZ3e2T3JJ"),
-    "edward": ("37cb3b4f-ffed-4e77-a447-3c319b1753d3", "C4Svaa7djC8d3CVxaohrsedccaKqimNoJrWe9iNPdix5"),
-    # removed 2026-10-09 for losing on paper (main rule, $100 a trade): untaxxable -412.28 (3/17 won),
-    # _logjam -105.69 (2/7), jackduvalcalls -85.16 (2/5)
+    # 2026-10-26, Ashish: follow slingoor only. The id is the one in his avatar's path on pump.fun/profile/slingoor
+    # (pump.fun/profile/<id> opens the same profile); the wallet is the address on that page.
+    "slingoor": ("2aa1dd90-aa5b-459d-9945-7dc72ec5bd2a", "5YRgrP3mjGzrzirYYN5HAQH19cTYREYwGxW6XRJQUzij"),
+    # The 22 callers followed until then (ca854b8, with their ids and wallets) were dropped the same day.
 }
 BY_PROFILE = {profile: name for name, (profile, _) in CALLERS.items()}
 

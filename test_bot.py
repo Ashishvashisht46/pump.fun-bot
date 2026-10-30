@@ -19,6 +19,12 @@ from unittest import mock
 import bot
 
 ENTRY, TOKENS = 1.0, bot.STAKE_USD * (1 - bot.COST)       # a fill at $1.00 buys 98 tokens
+# The tests bring their own callers, so they pass whoever the bot follows.
+bot.CALLERS = {"schoen": ("cd23adcb-133e-4614-9493-535dc5c3c85a", "5hAgYC8TJCcEZV7LTXAzkTrm7YL29YXyQQJPCNrG84zM"),
+               "marcell": ("240b8242-5715-492e-828c-1622aac53376", "6vbrTLsWy76TxDQAUKLqZrPohQuq6EVaJgfGzR82paFa"),
+               "ily": ("e77e7b24-34ee-4a1e-9966-3fa8c27f46e8", "AcoNeFQsTPYs7ZrH8RMWaxxGJTTQJJ4H5aTXmptaz5UK"),
+               "SoloFNF": ("d18fbf14-83bd-4331-acfe-920c81096899", "GccvEcZqMrcNdp3CarCasGdN5dUfdQ4wZ6iQsk5myRzX")}
+bot.BY_PROFILE = {profile: name for name, (profile, _) in bot.CALLERS.items()}
 PROFILE = {name: ids[0] for name, ids in bot.CALLERS.items()}
 WALLET = bot.CALLERS["schoen"][1]
 
